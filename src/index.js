@@ -232,18 +232,26 @@ async function runCheck(env, options) {
       alertSent = telegramResult.ok;
     }
 
-    if (options.saveState && kvBindingPresent) {
-      await env.BMS_STATE.put(
-        CONFIG.kvStateKey,
-        JSON.stringify({
-          ...currentState,
-          previousCheckedAt: previousState ? previousState.checkedAt : null,
-          lastComparison: comparison,
-          lastAlertAttempted: Boolean(options.sendAlerts && comparison.shouldAlert),
-          lastAlertSent: alertSent,
-          lastTelegramResult: sanitizeTelegramResult(telegramResult)
-        })
+        const safeToSave =
+      options.forceSave ||
+      (
+        currentState.pageFetchedSuccessfully &&
+        currentState.httpStatus === 200 &&
+        currentState.targetMovieFound &&
+        currentState.showtimeCount > 0
       );
+
+    if (options.saveState && kvBindingPresent && safeToSave) {
+      const stateToSave = {
+        ...currentState,
+        previousCheckedAt: previousState ? previousState.checkedAt : null,
+        lastComparison: comparison,
+        lastAlertAttempted: Boolean(options.sendAlerts && comparison.shouldAlert),
+        lastAlertSent: alertSent,
+        lastTelegramResult: sanitizeTelegramResult(telegramResult)
+      };
+
+      await env.BMS_STATE.put(CONFIG.kvStateKey, JSON.stringify(stateToSave));
     }
 
     const output = {
