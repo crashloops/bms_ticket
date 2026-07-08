@@ -2,9 +2,6 @@ name: BMS Showtime Monitor
 
 on:
   workflow_dispatch:
-  schedule:
-    # Every 10 minutes. Offset from :00 to avoid busiest cron minute.
-    - cron: "7-59/10 * * * *"
 
 concurrency:
   group: bms-showtime-monitor
