@@ -22,7 +22,7 @@ const CONFIG = {
 
   alertOnShowtimeChanges: true,
 
-  // Recommended false: first run saves baseline but does not alert.
+  // Recommended false: first good run saves baseline but does not alert.
   alertOnFirstRun: false,
 
   sendErrorAlerts: false,
@@ -36,7 +36,6 @@ const CONFIG = {
 
   availabilityKeywords: [
     "available",
-    "book",
     "buy tickets",
     "select show timings",
     "select seats",
@@ -78,8 +77,9 @@ export default {
           "Routes:",
           "/test - run check without alert or saving",
           "/debug - show safe debug output",
-          "/seed - save current page as baseline",
+          "/seed - save current page as baseline only if page is usable",
           "/last - show last saved state",
+          "/clear - delete saved baseline",
           "/telegram-test - send a test Telegram message"
         ].join("\n")
       );
@@ -115,14 +115,34 @@ export default {
         mode: "seed",
         saveState: true,
         sendAlerts: false,
-        includeDebug: true,
-        forceSave: false
+        includeDebug: true
       });
 
       return jsonResponse({
         ...result,
-        seedMessage:
-          "Baseline saved. Future cron runs alert only when timings change."
+        seedMessage: result.stateSaved
+          ? "Baseline saved. Future cron runs alert only when timings change."
+          : "Baseline NOT saved. The page is not usable for monitoring, likely blocked or no showtimes found."
+      });
+    }
+
+    if (url.pathname === "/clear") {
+      const adminCheck = requireAdminIfConfigured(request, env);
+      if (!adminCheck.ok) return jsonResponse(adminCheck, 401);
+
+      if (!env.BMS_STATE) {
+        return jsonResponse({
+          ok: false,
+          error: "KV binding BMS_STATE is missing."
+        });
+      }
+
+      await env.BMS_STATE.delete(CONFIG.kvStateKey);
+
+      return jsonResponse({
+        ok: true,
+        message: "Saved baseline deleted from KV.",
+        deletedKey: CONFIG.kvStateKey
       });
     }
 
@@ -160,7 +180,14 @@ export default {
       {
         ok: false,
         error: "Unknown route",
-        availableRoutes: ["/test", "/debug", "/seed", "/last", "/telegram-test"]
+        availableRoutes: [
+          "/test",
+          "/debug",
+          "/seed",
+          "/last",
+          "/clear",
+          "/telegram-test"
+        ]
       },
       404
     );
@@ -183,12 +210,16 @@ export default {
 async function runCheck(env, options) {
   const checkedAt = new Date().toISOString();
   const kvBindingPresent = Boolean(env.BMS_STATE);
-  const telegramConfigured = Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID);
+  const telegramConfigured = Boolean(
+    env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID
+  );
 
   try {
     const previousState = kvBindingPresent ? await readLastState(env) : null;
     const fetchResult = await fetchTargetPage();
     const analysis = analyzePage(fetchResult.html || "");
+
+    const blockedPageDetected = isBlockedPage(fetchResult, analysis);
 
     const currentState = {
       checkedAt,
@@ -201,6 +232,8 @@ async function runCheck(env, options) {
       httpRequestSucceeded: fetchResult.httpRequestSucceeded,
       httpStatus: fetchResult.httpStatus,
       fetchError: fetchResult.fetchError,
+
+      blockedPageDetected,
 
       targetMovieFound: analysis.targetMovieFound,
       targetFormatFound: analysis.targetFormatFound,
@@ -232,16 +265,16 @@ async function runCheck(env, options) {
       alertSent = telegramResult.ok;
     }
 
-        const safeToSave =
-      options.forceSave ||
-      (
-        currentState.pageFetchedSuccessfully &&
-        currentState.httpStatus === 200 &&
-        currentState.targetMovieFound &&
-        currentState.showtimeCount > 0
-      );
+    const pageUsableForMonitoring =
+      currentState.pageFetchedSuccessfully &&
+      currentState.httpStatus === 200 &&
+      !currentState.blockedPageDetected &&
+      currentState.targetMovieFound &&
+      currentState.showtimeCount > 0;
 
-    if (options.saveState && kvBindingPresent && safeToSave) {
+    let stateActuallySaved = false;
+
+    if (options.saveState && kvBindingPresent && pageUsableForMonitoring) {
       const stateToSave = {
         ...currentState,
         previousCheckedAt: previousState ? previousState.checkedAt : null,
@@ -252,6 +285,7 @@ async function runCheck(env, options) {
       };
 
       await env.BMS_STATE.put(CONFIG.kvStateKey, JSON.stringify(stateToSave));
+      stateActuallySaved = true;
     }
 
     const output = {
@@ -271,6 +305,9 @@ async function runCheck(env, options) {
       httpStatus: currentState.httpStatus,
       fetchError: currentState.fetchError,
 
+      blockedPageDetected,
+      pageUsableForMonitoring,
+
       targetMovieFound: currentState.targetMovieFound,
       targetFormatFound: currentState.targetFormatFound,
       targetTimeFound: currentState.targetTimeFound,
@@ -280,7 +317,9 @@ async function runCheck(env, options) {
 
       extractedShowtimes: currentState.extractedShowtimes,
       showtimeCount: currentState.showtimeCount,
-      previousShowtimeCount: previousState ? previousState.showtimeCount || 0 : null,
+      previousShowtimeCount: previousState
+        ? previousState.showtimeCount || 0
+        : null,
       baselineExists: Boolean(previousState),
 
       showtimesChanged: comparison.showtimesChanged,
@@ -288,7 +327,12 @@ async function runCheck(env, options) {
       removedShowtimes: comparison.removedShowtimes,
       alertWouldBeSent: comparison.shouldAlert,
       alertSent,
-      stateSaved: Boolean(options.saveState && kvBindingPresent),
+
+      stateSaved: stateActuallySaved,
+      stateSaveSkippedReason: stateActuallySaved
+        ? null
+        : getStateSaveSkippedReason(options, kvBindingPresent, pageUsableForMonitoring, currentState),
+
       telegramResult: sanitizeTelegramResult(telegramResult)
     };
 
@@ -356,7 +400,8 @@ async function fetchTargetPage() {
       redirect: "follow",
       signal: controller.signal,
       headers: {
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-IN,en;q=0.9",
         "cache-control": "no-cache",
         pragma: "no-cache",
@@ -414,11 +459,17 @@ function analyzePage(html) {
   const filteredShowtimes = extractedShowtimes.filter((item) => {
     const label = item.label.toLowerCase();
 
-    if (CONFIG.targetFormat && !label.includes(CONFIG.targetFormat.toLowerCase())) {
+    if (
+      CONFIG.targetFormat &&
+      !label.includes(CONFIG.targetFormat.toLowerCase())
+    ) {
       return false;
     }
 
-    if (CONFIG.targetTime && item.time.toLowerCase() !== CONFIG.targetTime.toLowerCase()) {
+    if (
+      CONFIG.targetTime &&
+      item.time.toLowerCase() !== CONFIG.targetTime.toLowerCase()
+    ) {
       return false;
     }
 
@@ -475,7 +526,10 @@ function extractShowtimesForTargetMovie(text) {
 
     while ((match = timeRegex.exec(segment)) !== null) {
       const rawTime = normalizeTime(match[0]);
-      const nearTimeText = segment.slice(Math.max(0, match.index - 80), match.index + 140);
+      const nearTimeText = segment.slice(
+        Math.max(0, match.index - 80),
+        match.index + 140
+      );
       const detectedFormat = detectFormat(`${nearTimeText} ${rowDescriptor}`);
 
       const label = dedupeWords(
@@ -513,7 +567,9 @@ function extractRowDescriptor(segment) {
 
 function detectFormat(text) {
   const lower = text.toLowerCase();
-  const found = CONFIG.knownFormatKeywords.filter((format) => lower.includes(format));
+  const found = CONFIG.knownFormatKeywords.filter((format) =>
+    lower.includes(format)
+  );
 
   if (!found.length) return "";
 
@@ -544,8 +600,13 @@ function compareStates(previousState, currentState) {
       showtimesChanged: false,
       addedShowtimes: [],
       removedShowtimes: [],
-      shouldAlert: CONFIG.alertOnFirstRun && currentState.showtimeCount > 0,
-      reason: "No previous baseline found. Current state will be saved first."
+      shouldAlert:
+        CONFIG.alertOnFirstRun &&
+        currentState.pageFetchedSuccessfully &&
+        !currentState.blockedPageDetected &&
+        currentState.targetMovieFound &&
+        currentState.showtimeCount > 0,
+      reason: "No previous baseline found. Current good state will be saved first."
     };
   }
 
@@ -556,12 +617,18 @@ function compareStates(previousState, currentState) {
     (currentState.extractedShowtimes || []).map((item) => item.label)
   );
 
-  const addedShowtimes = [...currentLabels].filter((label) => !previousLabels.has(label));
-  const removedShowtimes = [...previousLabels].filter((label) => !currentLabels.has(label));
-  const showtimesChanged = addedShowtimes.length > 0 || removedShowtimes.length > 0;
+  const addedShowtimes = [...currentLabels].filter(
+    (label) => !previousLabels.has(label)
+  );
+  const removedShowtimes = [...previousLabels].filter(
+    (label) => !currentLabels.has(label)
+  );
+  const showtimesChanged =
+    addedShowtimes.length > 0 || removedShowtimes.length > 0;
 
   const basicPageHealthy =
     currentState.pageFetchedSuccessfully &&
+    !currentState.blockedPageDetected &&
     currentState.targetMovieFound &&
     currentState.showtimeCount > 0;
 
@@ -570,8 +637,11 @@ function compareStates(previousState, currentState) {
     showtimesChanged,
     addedShowtimes,
     removedShowtimes,
-    shouldAlert: CONFIG.alertOnShowtimeChanges && showtimesChanged && basicPageHealthy,
-    reason: showtimesChanged ? "Showtime list changed." : "No showtime change detected."
+    shouldAlert:
+      CONFIG.alertOnShowtimeChanges && showtimesChanged && basicPageHealthy,
+    reason: showtimesChanged
+      ? "Showtime list changed."
+      : "No showtime change detected."
   };
 }
 
@@ -591,13 +661,17 @@ function buildShowtimeChangeMessage(currentState, comparison) {
 
   if (comparison.addedShowtimes.length) {
     lines.push("✅ Added timings:");
-    comparison.addedShowtimes.slice(0, 20).forEach((item) => lines.push(`+ ${item}`));
+    comparison.addedShowtimes
+      .slice(0, 20)
+      .forEach((item) => lines.push(`+ ${item}`));
     lines.push("");
   }
 
   if (comparison.removedShowtimes.length) {
     lines.push("❌ Removed timings:");
-    comparison.removedShowtimes.slice(0, 20).forEach((item) => lines.push(`- ${item}`));
+    comparison.removedShowtimes
+      .slice(0, 20)
+      .forEach((item) => lines.push(`- ${item}`));
     lines.push("");
   }
 
@@ -674,6 +748,42 @@ function requireAdminIfConfigured(request, env) {
   };
 }
 
+function isBlockedPage(fetchResult, analysis) {
+  const title = String(analysis.pageTitle || "").toLowerCase();
+  const preview = String(analysis.normalizedTextPreview || "").toLowerCase();
+
+  return (
+    fetchResult.httpStatus === 403 ||
+    title.includes("attention required") ||
+    preview.includes("sorry, you have been blocked") ||
+    preview.includes("you are unable to access bookmyshow.com") ||
+    preview.includes("please enable cookies") ||
+    preview.includes("cloudflare ray id")
+  );
+}
+
+function getStateSaveSkippedReason(
+  options,
+  kvBindingPresent,
+  pageUsableForMonitoring,
+  currentState
+) {
+  if (!options.saveState) return "saveState is false for this route.";
+  if (!kvBindingPresent) return "KV binding BMS_STATE is missing.";
+  if (pageUsableForMonitoring) return null;
+  if (currentState.blockedPageDetected)
+    return "Blocked page detected. Not saving bad baseline.";
+  if (!currentState.pageFetchedSuccessfully)
+    return "Page fetch was not successful.";
+  if (currentState.httpStatus !== 200)
+    return `HTTP status is ${currentState.httpStatus}, not 200.`;
+  if (!currentState.targetMovieFound)
+    return "Target movie was not found.";
+  if (currentState.showtimeCount <= 0)
+    return "No showtimes found.";
+  return "Page is not usable for monitoring.";
+}
+
 function normalizeText(html) {
   return decodeBasicHtmlEntities(
     decodeUnicodeEscapes(String(html || ""))
@@ -712,13 +822,16 @@ function extractTitle(html) {
 }
 
 function matchedTerms(lowerText, terms) {
-  return [...new Set(terms.map((x) => String(x || "").trim()).filter(Boolean))].filter(
-    (term) => lowerText.includes(term.toLowerCase())
-  );
+  return [
+    ...new Set(terms.map((x) => String(x || "").trim()).filter(Boolean))
+  ].filter((term) => lowerText.includes(term.toLowerCase()));
 }
 
 function normalizeTime(value) {
-  return String(value || "").replace(/\s+/g, " ").trim().toUpperCase();
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
 }
 
 function uniqueShowtimes(items) {
@@ -743,7 +856,9 @@ function dedupeWords(text) {
 
 function buildContexts(text, terms) {
   const lowerText = text.toLowerCase();
-  const cleanTerms = [...new Set(terms.map((x) => String(x || "").trim()).filter(Boolean))];
+  const cleanTerms = [
+    ...new Set(terms.map((x) => String(x || "").trim()).filter(Boolean))
+  ];
 
   return cleanTerms
     .map((term) => {
