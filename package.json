@@ -1,0 +1,19 @@
+{
+  "name": "bms-ticket-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Free Cloudflare Worker monitor for BookMyShow showtime changes with Telegram alerts.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv namespace create BMS_STATE",
+    "secret:telegram-token": "wrangler secret put TELEGRAM_BOT_TOKEN",
+    "secret:telegram-chat": "wrangler secret put TELEGRAM_CHAT_ID",
+    "secret:admin-key": "wrangler secret put ADMIN_KEY"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
