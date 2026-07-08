@@ -116,7 +116,7 @@ export default {
         saveState: true,
         sendAlerts: false,
         includeDebug: true,
-        forceSave: true
+        forceSave: false
       });
 
       return jsonResponse({
