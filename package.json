@@ -9,11 +9,15 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "kv:create": "wrangler kv namespace create BMS_STATE",
-    "secret:telegram-token": "wrangler secret put 8529329276:AAGkLG2D0RlKZZdkKNzVUTL8Y-LqvQukYag",
-    "secret:telegram-chat": "wrangler secret put 358047963",
-    "secret:admin-key": "wrangler secret put bms-private-key"
+    "secret:telegram-token": "wrangler secret put TELEGRAM_BOT_TOKEN",
+    "secret:telegram-chat": "wrangler secret put TELEGRAM_CHAT_ID",
+    "secret:admin-key": "wrangler secret put ADMIN_KEY",
+    "checkly:test": "checkly test",
+    "checkly:deploy": "checkly deploy"
   },
   "devDependencies": {
+    "@playwright/test": "latest",
+    "checkly": "^8.17.1",
     "wrangler": "latest"
   }
 }

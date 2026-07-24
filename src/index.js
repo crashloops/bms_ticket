@@ -65,6 +65,10 @@ const CONFIG = {
   debugPreviewChars: 1500
 };
 
+const ACTIVE_WATCH_KEY = "bms:active-watch";
+const SNAPSHOT_KEY_PREFIX = "bms:snapshot:";
+const HISTORY_KEY_PREFIX = "bms:history:";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -75,6 +79,7 @@ export default {
           "BookMyShow monitor is live.",
           "",
           "Routes:",
+          "/telegram - Telegram webhook for watch commands",
           "/test - run check without alert or saving",
           "/debug - show safe debug output",
           "/seed - save current page as baseline only if page is usable",
@@ -83,6 +88,10 @@ export default {
           "/telegram-test - send a test Telegram message"
         ].join("\n")
       );
+    }
+
+    if (url.pathname === "/telegram" && request.method === "POST") {
+      return handleTelegramWebhook(request, env);
     }
 
     if (url.pathname === "/test") {
@@ -890,6 +899,306 @@ function sanitizeTelegramResult(result) {
     status: result.status || null,
     bodyPreview: result.bodyPreview || null
   };
+}
+
+async function handleTelegramWebhook(request, env) {
+  if (!env.BMS_STATE) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "KV binding BMS_STATE is missing."
+      },
+      500
+    );
+  }
+
+  if (!isValidTelegramWebhookSecret(request, env)) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "Invalid Telegram webhook secret."
+      },
+      401
+    );
+  }
+
+  let update;
+  try {
+    update = await request.json();
+  } catch {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "Invalid Telegram update payload."
+      },
+      400
+    );
+  }
+
+  const message = update?.message;
+  const chatId = String(message?.chat?.id || "");
+  const text = String(message?.text || "").trim();
+
+  if (!message || !text) {
+    return jsonResponse({ ok: true, ignored: "no_message_text" });
+  }
+
+  if (!isAuthorizedTelegramChat(chatId, env)) {
+    return jsonResponse({ ok: true, ignored: "unauthorized_chat" });
+  }
+
+  const replyText = await processTelegramCommand(text, chatId, env);
+  await sendTelegramFromWorker(env, chatId, replyText);
+
+  return jsonResponse({ ok: true });
+}
+
+async function processTelegramCommand(text, chatId, env) {
+  if (text.startsWith("/watch")) {
+    const targetUrl = text.replace(/^\/watch\s+/i, "").trim();
+
+    if (!targetUrl) {
+      return [
+        "Usage:",
+        "/watch https://in.bookmyshow.com/..."
+      ].join("\n");
+    }
+
+    if (!isValidBookMyShowUrl(targetUrl)) {
+      return "Invalid URL. It must start with https://in.bookmyshow.com/";
+    }
+
+    const now = new Date().toISOString();
+    const watchId = Date.now().toString(36);
+    const watch = {
+      active: true,
+      watchId,
+      targetUrl,
+      mode: "all_movies",
+      createdAt: now,
+      updatedAt: now,
+      createdByChatId: chatId
+    };
+
+    await env.BMS_STATE.put(ACTIVE_WATCH_KEY, JSON.stringify(watch));
+
+    return [
+      "[OK] Watch saved.",
+      "Baseline will be created silently on the next Checkly run."
+    ].join("\n");
+  }
+
+  if (text === "/status") {
+    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+
+    if (!watch) {
+      return "No active watch.";
+    }
+
+    const snapshot = await readWorkerJson(
+      env,
+      `${SNAPSHOT_KEY_PREFIX}${watch.watchId}`
+    );
+
+    const lines = [
+      "Active watch:",
+      `URL: ${watch.targetUrl}`,
+      `Watch ID: ${watch.watchId}`,
+      `Active: ${Boolean(watch.active)}`,
+      `Last checked: ${snapshot?.checkedAt || "Not checked yet"}`,
+      `Last show count: ${
+        snapshot?.showCount === undefined ? "Unknown" : snapshot.showCount
+      }`,
+      "Use /history to see the last 5 checks."
+    ];
+
+    if (watch.active === false) {
+      lines.push(
+        "Monitoring is stopped. Send /watch <BookMyShow URL> to restart."
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  if (text === "/history") {
+    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+
+    if (!watch || !watch.watchId) {
+      return "No watch history found.";
+    }
+
+    const history = await readWorkerJson(
+      env,
+      `${HISTORY_KEY_PREFIX}${watch.watchId}`
+    );
+
+    if (!Array.isArray(history) || !history.length) {
+      return "No check history yet.";
+    }
+
+    return [
+      "Last 5 checks:",
+      ...history.slice(0, 5).map((entry, index) => {
+        const parts = [
+          `${index + 1}. ${formatHistoryTime(entry.checkedAt)} - ${entry.status}`,
+          `${entry.showCount ?? 0} shows`
+        ];
+
+        if (entry.status === "readable") {
+          parts.push(
+            entry.reason || `${entry.addedCount || 0} / ${entry.removedCount || 0} / status ${entry.statusChangedCount || 0}`
+          );
+        }
+
+        if (
+          typeof entry.addedCount === "number" ||
+          typeof entry.removedCount === "number" ||
+          typeof entry.statusChangedCount === "number"
+        ) {
+          parts.push(
+            `+${entry.addedCount || 0} / -${entry.removedCount || 0} / status ${entry.statusChangedCount || 0}`
+          );
+        }
+
+        return parts.join(" - ");
+      })
+    ].join("\n");
+  }
+
+  if (text === "/stop") {
+    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+
+    if (!watch || watch.active !== true) {
+      return "No active watch to stop.";
+    }
+
+    const nextWatch = {
+      ...watch,
+      active: false,
+      updatedAt: new Date().toISOString()
+    };
+
+    await env.BMS_STATE.put(ACTIVE_WATCH_KEY, JSON.stringify(nextWatch));
+    return [
+      "[OK] Watch stopped.",
+      "Checkly will exit early until you send a new /watch link."
+    ].join("\n");
+  }
+
+  if (text === "/help") {
+    return [
+      "Commands:",
+      "/watch <BookMyShow URL>",
+      "/status",
+      "/history",
+      "/stop",
+      "/help"
+    ].join("\n");
+  }
+
+  return [
+    "Unknown command.",
+    "Use /help to see available commands."
+  ].join("\n");
+}
+
+async function readWorkerJson(env, key) {
+  if (!env.BMS_STATE) return null;
+
+  const raw = await env.BMS_STATE.get(key);
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function isAuthorizedTelegramChat(chatId, env) {
+  return String(chatId || "") === String(env.TELEGRAM_ADMIN_CHAT_ID || "");
+}
+
+function isValidBookMyShowUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "in.bookmyshow.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function formatHistoryTime(iso) {
+  if (!iso) return "Unknown time";
+
+  try {
+    return new Date(iso).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true
+    });
+  } catch {
+    return String(iso);
+  }
+}
+
+function isValidTelegramWebhookSecret(request, env) {
+  if (!env.TELEGRAM_WEBHOOK_SECRET) return true;
+
+  const providedSecret = request.headers.get(
+    "x-telegram-bot-api-secret-token"
+  );
+
+  return timingSafeEqual(
+    String(providedSecret || ""),
+    String(env.TELEGRAM_WEBHOOK_SECRET || "")
+  );
+}
+
+function timingSafeEqual(left, right) {
+  const leftText = String(left || "");
+  const rightText = String(right || "");
+  const maxLength = Math.max(leftText.length, rightText.length);
+  let diff = leftText.length ^ rightText.length;
+
+  for (let i = 0; i < maxLength; i++) {
+    diff |=
+      (leftText.charCodeAt(i) || 0) ^ (rightText.charCodeAt(i) || 0);
+  }
+
+  return diff === 0;
+}
+
+async function sendTelegramFromWorker(env, chatId, text) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN secret.");
+  }
+
+  const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const response = await fetch(telegramUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: false
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Telegram webhook reply failed: HTTP ${response.status} ${await response.text()}`
+    );
+  }
 }
 
 function jsonResponse(data, status = 200) {
