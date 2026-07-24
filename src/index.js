@@ -1046,18 +1046,16 @@ async function processTelegramCommand(text, chatId, env) {
         ];
 
         if (entry.status === "readable") {
-          parts.push(
-            entry.reason || `${entry.addedCount || 0} / ${entry.removedCount || 0} / status ${entry.statusChangedCount || 0}`
-          );
-        }
+          const addedCount = entry.addedCount || 0;
+          const removedCount = entry.removedCount || 0;
+          const statusChangedCount = entry.statusChangedCount || 0;
 
-        if (
-          typeof entry.addedCount === "number" ||
-          typeof entry.removedCount === "number" ||
-          typeof entry.statusChangedCount === "number"
-        ) {
           parts.push(
-            `+${entry.addedCount || 0} / -${entry.removedCount || 0} / status ${entry.statusChangedCount || 0}`
+            addedCount === 0 &&
+              removedCount === 0 &&
+              statusChangedCount === 0
+              ? "no changes"
+              : `+${addedCount} / -${removedCount} / status ${statusChangedCount}`
           );
         }
 
@@ -1136,14 +1134,14 @@ function formatHistoryTime(iso) {
   if (!iso) return "Unknown time";
 
   try {
-    return new Date(iso).toLocaleString("en-IN", {
+    return `${new Date(iso).toLocaleString("en-IN", {
       timeZone: "Asia/Kolkata",
       day: "2-digit",
       month: "short",
       hour: "2-digit",
       minute: "2-digit",
       hour12: true
-    });
+    })} IST`;
   } catch {
     return String(iso);
   }

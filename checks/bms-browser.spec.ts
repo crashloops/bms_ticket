@@ -5,7 +5,7 @@ const CONFIG = {
   activeWatchKey: "bms:active-watch",
   snapshotKeyPrefix: "bms:snapshot:",
   historyKeyPrefix: "bms:history:",
-  monitorSchemaVersion: 4,
+  monitorSchemaVersion: 6,
   pageSettleMs: 12000
 };
 
@@ -16,6 +16,12 @@ const REQUIRED_ENV = [
   "CLOUDFLARE_ACCOUNT_ID",
   "CLOUDFLARE_KV_NAMESPACE_ID"
 ];
+
+type StatusKind =
+  | "available"
+  | "fast_filling"
+  | "housefull_or_unavailable"
+  | "unknown";
 
 type ActiveWatch = {
   active: boolean;
@@ -34,7 +40,7 @@ type ShowtimeSnapshot = {
   row: string;
   time: string;
   screenText: string;
-  status: "available" | "fast_filling" | "housefull_or_unavailable" | "unknown";
+  status: StatusKind;
   rawColor: string;
   label: string;
 };
@@ -47,6 +53,19 @@ type SnapshotState = {
   checkedAt: string;
   showCount: number;
   items: ShowtimeSnapshot[];
+};
+
+type StatusChange = {
+  before: ShowtimeSnapshot;
+  after: ShowtimeSnapshot;
+};
+
+type Decision = {
+  shouldSendTelegram: boolean;
+  reason: string;
+  added?: ShowtimeSnapshot[];
+  removed?: ShowtimeSnapshot[];
+  statusChanged?: StatusChange[];
 };
 
 function validateEnv() {
@@ -115,7 +134,7 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
     timeout: 45000
   });
 
-  const httpStatus = response ? response.status() : null;
+  const httpStatus = response ? response.status() : 0;
 
   await page.waitForTimeout(CONFIG.pageSettleMs);
 
@@ -127,24 +146,23 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
 
   const pageTitle = await page.title();
   const bodyText = await page.locator("body").innerText({ timeout: 15000 });
-  const extractedShowtimes = await extractAllMovieShowtimes(page, bodyText);
+  const extractedShowtimes = await extractAllShowtimesFromPage(page, bodyText);
 
+  const pageBlocked = isBlockedPage({
+    httpStatus,
+    pageTitle,
+    bodyText
+  });
   const pageUsableForMonitoring =
-    httpStatus !== null &&
     httpStatus >= 200 &&
     httpStatus < 400 &&
-    !isBlockedPage({
-      httpStatus,
-      pageTitle,
-      bodyText
-    }) &&
+    !pageBlocked &&
     extractedShowtimes.length > 0;
 
   if (!pageUsableForMonitoring) {
-    const blockedDecision = {
-      shouldSendTelegram: false,
-      reason: "Page blocked or unusable."
-    };
+    const reason = pageBlocked
+      ? "Page blocked or unusable."
+      : "No readable showtimes found.";
 
     await appendCheckHistory(activeWatch.watchId, {
       checkedAt,
@@ -154,7 +172,7 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
       targetUrl: activeWatch.targetUrl,
       showCount: extractedShowtimes.length,
       alertSent: false,
-      reason: blockedDecision.reason,
+      reason,
       addedCount: 0,
       removedCount: 0,
       statusChangedCount: 0
@@ -166,9 +184,8 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
           targetUrl: activeWatch.targetUrl,
           pageTitle,
           httpStatus,
-          pageUsableForMonitoring,
           showtimeCount: extractedShowtimes.length,
-          decisionReason: blockedDecision.reason
+          reason
         },
         null,
         2
@@ -200,11 +217,7 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
     reason: decision.reason,
     addedCount: decision.added?.length || 0,
     removedCount: decision.removed?.length || 0,
-    statusChangedCount:
-      decision.statusChanged?.length ||
-      decision.changedStatus?.length ||
-      decision.changedAvailability?.length ||
-      0
+    statusChangedCount: decision.statusChanged?.length || 0
   });
 
   console.log(
@@ -214,9 +227,10 @@ test("Monitor BookMyShow listing changes", async ({ page }) => {
         pageTitle,
         httpStatus,
         showtimeCount: currentSnapshot.showCount,
-        pageUsableForMonitoring,
         decisionReason: decision.reason,
-        extractedShowtimes: currentSnapshot.items
+        addedCount: decision.added?.length || 0,
+        removedCount: decision.removed?.length || 0,
+        statusChangedCount: decision.statusChanged?.length || 0
       },
       null,
       2
@@ -247,7 +261,7 @@ async function appendCheckHistory(watchId: string, entry: any) {
     if (Array.isArray(existing)) {
       history = existing;
     }
-  } catch (error) {
+  } catch {
     history = [];
   }
 
@@ -257,85 +271,125 @@ async function appendCheckHistory(watchId: string, entry: any) {
   await writeKvJson(key, history);
 }
 
-async function extractAllMovieShowtimes(page: any, bodyText: string) {
-  const normalizedText = normalizeText(bodyText);
-  const textItems = extractMovieShowtimeSnapshots(normalizedText);
-  const domItems = await extractShowtimeStatusesFromDom(page, textItems);
-
-  if (!domItems.length) {
-    return textItems;
-  }
-
-  const textById = new Map(textItems.map((item) => [item.id, item]));
-  return domItems.map((item) => {
-    const fallback = textById.get(item.id);
-    return fallback
-      ? {
-          ...fallback,
-          status: item.status,
-          rawColor: item.rawColor,
-          label: buildSnapshotLabel({
-            ...fallback,
-            status: item.status,
-            rawColor: item.rawColor
-          })
-        }
-      : item;
-  });
+async function extractAllShowtimesFromPage(page: any, bodyText: string) {
+  const textItems = extractAllShowtimesFromText(bodyText);
+  return extractShowtimeStatusesFromDom(page, textItems);
 }
 
-function extractMovieShowtimeSnapshots(text: string): ShowtimeSnapshot[] {
-  const markerRegex = /([A-Za-z0-9][A-Za-z0-9\s:&'",.!+\-/]+?)\s*\((UA13\+|UA16\+|UA|A|U)\)/g;
+function stopFooterNoise(text: string) {
+  return String(text || "")
+    .replace(/HomeCinemas[\s\S]*$/i, "")
+    .replace(/List your Show[\s\S]*$/i, "")
+    .replace(/Got a show[\s\S]*$/i, "")
+    .replace(/24\/7 CUSTOMER CARE[\s\S]*$/i, "")
+    .replace(/MOVIES NOW SHOWING[\s\S]*$/i, "")
+    .trim();
+}
+
+function extractAllShowtimesFromText(bodyText: string) {
+  const text = stopFooterNoise(String(bodyText || "").replace(/\r/g, "\n"));
+
+  const movieMarkerRegex =
+    /([A-Z][A-Za-z0-9:'\u2019.,&\- ]{2,100}?)\s*\((U|A|UA|UA\d+\+?|U\/A|U\/A\s*\d+\+?)\)/g;
+
   const markers: Array<{
+    index: number;
+    endIndex: number;
+    fullText: string;
     movie: string;
     rating: string;
-    index: number;
-    markerText: string;
   }> = [];
-  let markerMatch;
 
-  while ((markerMatch = markerRegex.exec(text)) !== null) {
+  let match: RegExpExecArray | null;
+
+  while ((match = movieMarkerRegex.exec(text)) !== null) {
+    const movie = match[1].trim();
+
+    if (
+      /customer care|newsletter|movies now showing|homecinemas|list your show/i.test(
+        movie
+      )
+    ) {
+      continue;
+    }
+
     markers.push({
-      movie: dedupeWords(markerMatch[1]),
-      rating: markerMatch[2],
-      index: markerMatch.index,
-      markerText: markerMatch[0]
+      index: match.index,
+      endIndex: match.index + match[0].length,
+      fullText: match[0],
+      movie,
+      rating: match[2].trim()
     });
   }
 
-  if (!markers.length) return [];
-
-  const snapshots: ShowtimeSnapshot[] = [];
-  const timeRegex = /\b(?:0?[1-9]|1[0-2]):[0-5][0-9]\s*(?:AM|PM)\b/gi;
+  const results: ShowtimeSnapshot[] = [];
 
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
-    const blockStart = marker.index + marker.markerText.length;
-    const blockEnd = markers[i + 1] ? markers[i + 1].index : text.length;
-    const block = text.slice(blockStart, blockEnd).trim();
+    const nextMarker = markers[i + 1];
+    const blockEnd = nextMarker ? nextMarker.index : text.length;
+    let block = text.slice(marker.index, blockEnd);
+    block = stopFooterNoise(block);
 
-    if (!block) continue;
+    const blockBody = block
+      .replace(marker.fullText, "")
+      .replace(/\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-    const timeMatches = Array.from(block.matchAll(timeRegex));
-    if (!timeMatches.length) continue;
+    const firstTimeMatch = blockBody.match(
+      /\b(?:0?[1-9]|1[0-2]):[0-5][0-9]\s*(?:AM|PM)\b/i
+    );
 
-    const beforeFirstTime = block.slice(0, timeMatches[0].index || 0);
-    const row = dedupeWords(beforeFirstTime).slice(0, 180);
+    if (!firstTimeMatch || firstTimeMatch.index === undefined) {
+      continue;
+    }
 
-    for (let j = 0; j < timeMatches.length; j++) {
-      const currentMatch = timeMatches[j];
-      const nextMatch = timeMatches[j + 1];
-      const time = normalizeTime(currentMatch[0]);
-      const currentIndex = currentMatch.index || 0;
-      const currentEnd = currentIndex + currentMatch[0].length;
-      const nextIndex = nextMatch ? nextMatch.index || block.length : block.length;
-      const screenText = dedupeWords(block.slice(currentEnd, nextIndex)).slice(
-        0,
-        180
-      );
-      const id = buildShowtimeId(marker.movie, row, time, screenText);
+    const row = blockBody
+      .slice(0, firstTimeMatch.index)
+      .replace(/\s+/g, " ")
+      .trim();
 
-      const item: ShowtimeSnapshot = {
+    if (!row || row.length > 80) {
+      continue;
+    }
+
+    const timeRegex = /\b(?:0?[1-9]|1[0-2]):[0-5][0-9]\s*(?:AM|PM)\b/gi;
+    const matches = [...blockBody.matchAll(timeRegex)];
+
+    for (let j = 0; j < matches.length; j++) {
+      const timeMatch = matches[j];
+      if (timeMatch.index === undefined) continue;
+
+      const time = normalizeTime(timeMatch[0]);
+      const currentEnd = timeMatch.index + timeMatch[0].length;
+      const nextTimeStart =
+        j + 1 < matches.length && matches[j + 1].index !== undefined
+          ? matches[j + 1].index
+          : blockBody.length;
+
+      let screenText = blockBody
+        .slice(currentEnd, nextTimeStart)
+        .replace(/\bAVAILABLE\b/gi, "")
+        .replace(/\bFAST FILLING\b/gi, "")
+        .replace(/\bLANG SUBTITLES\b/gi, "")
+        .replace(/\bSUBTITLES\b/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      screenText = stopFooterNoise(screenText).slice(0, 80).trim();
+
+      if (
+        /HomeCinemas|List your Show|Got a show|CUSTOMER CARE|MOVIES NOW SHOWING/i.test(
+          screenText
+        )
+      ) {
+        screenText = "";
+      }
+
+      const id = buildShowtimeId(marker.movie, row, time);
+
+      results.push({
         id,
         movie: marker.movie,
         rating: marker.rating,
@@ -344,22 +398,27 @@ function extractMovieShowtimeSnapshots(text: string): ShowtimeSnapshot[] {
         screenText,
         status: "unknown",
         rawColor: "",
-        label: ""
-      };
-
-      item.label = buildSnapshotLabel(item);
-      snapshots.push(item);
+        label: compactShowtime({
+          movie: marker.movie,
+          row,
+          time,
+          screenText
+        })
+      });
     }
   }
 
   const unique = new Map<string, ShowtimeSnapshot>();
-  for (const item of snapshots) {
+
+  for (const item of results) {
     if (!unique.has(item.id)) {
       unique.set(item.id, item);
     }
   }
 
-  return [...unique.values()].sort((a, b) => a.id.localeCompare(b.id));
+  return [...unique.values()].sort((left, right) =>
+    left.id.localeCompare(right.id)
+  );
 }
 
 async function extractShowtimeStatusesFromDom(
@@ -368,29 +427,31 @@ async function extractShowtimeStatusesFromDom(
 ): Promise<ShowtimeSnapshot[]> {
   if (!items.length) return [];
 
-  return page.evaluate((expected) => {
-    function clean(value: any) {
+  const statuses = await page.evaluate((expected: ShowtimeSnapshot[]) => {
+    function clean(value: unknown) {
       return String(value || "").replace(/\s+/g, " ").trim();
     }
 
-    function colorNameFromRgb(value: string) {
+    function colorBucket(value: string) {
       const raw = String(value || "").toLowerCase();
-      const rgbMatch = raw.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      const match = raw.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
 
-      if (!rgbMatch) return raw;
+      if (!match) return raw;
 
-      const r = Number(rgbMatch[1]);
-      const g = Number(rgbMatch[2]);
-      const b = Number(rgbMatch[3]);
+      const red = Number(match[1]);
+      const green = Number(match[2]);
+      const blue = Number(match[3]);
 
-      if (g > 120 && r < 140) return "green_like";
-      if (r > 180 && g > 120 && b < 120) return "yellow_or_orange_like";
+      if (green >= 120 && red <= 140) return "green_like";
+      if (red >= 180 && green >= 120 && blue <= 140) {
+        return "yellow_or_orange_like";
+      }
       if (
-        r > 120 &&
-        g > 120 &&
-        b > 120 &&
-        Math.abs(r - g) < 35 &&
-        Math.abs(g - b) < 35
+        red >= 120 &&
+        green >= 120 &&
+        blue >= 120 &&
+        Math.abs(red - green) <= 35 &&
+        Math.abs(green - blue) <= 35
       ) {
         return "grey_like";
       }
@@ -398,96 +459,118 @@ async function extractShowtimeStatusesFromDom(
       return raw;
     }
 
-    function classifyStatus(color: string, backgroundColor: string, borderColor: string) {
-      const joined = [color, backgroundColor, borderColor].join(" ").toLowerCase();
+    function classifyStatus(rawColor: string): StatusKind {
+      const lower = rawColor.toLowerCase();
 
-      if (joined.includes("green_like")) return "available";
-      if (joined.includes("yellow_or_orange_like")) return "fast_filling";
-      if (joined.includes("grey_like")) return "housefull_or_unavailable";
+      if (lower.includes("green_like")) return "available";
+      if (lower.includes("yellow_or_orange_like")) return "fast_filling";
+      if (lower.includes("grey_like")) return "housefull_or_unavailable";
 
       return "unknown";
     }
 
-    const elements = Array.from(document.querySelectorAll("a, button, div, span"));
-    const results: any[] = [];
+    const nodes = Array.from(document.querySelectorAll("a, button, div, span"));
+    const result: Array<{ id: string; status: StatusKind; rawColor: string }> = [];
 
-    for (const expectedItem of expected) {
-      const movie = clean(expectedItem.movie);
-      const row = clean(expectedItem.row);
-      const time = clean(expectedItem.time);
-      const screenText = clean(expectedItem.screenText);
+    for (const item of expected) {
+      const movie = clean(item.movie).toLowerCase();
+      const row = clean(item.row).toLowerCase();
+      const time = clean(item.time);
 
-      const candidates = elements.filter((element: any) => {
-        const text = clean(element.innerText || element.textContent || "");
-        return text.includes(time);
+      const candidates = nodes.filter((node) => {
+        const text = clean(
+          (node as HTMLElement).innerText || node.textContent || ""
+        );
+        return text === time || text.includes(` ${time} `) || text.includes(time);
       });
 
-      let best: any = null;
+      let bestMatch:
+        | { element: Element; score: number }
+        | null = null;
 
       for (const element of candidates) {
-        const combined = clean(
+        const nearby = clean(
           [
-            element.innerText,
-            element.parentElement?.innerText,
-            element.parentElement?.parentElement?.innerText,
-            element.parentElement?.parentElement?.parentElement?.innerText
+            (element as HTMLElement).innerText,
+            (element.parentElement as HTMLElement | null)?.innerText,
+            (element.parentElement?.parentElement as HTMLElement | null)
+              ?.innerText,
+            (element.parentElement?.parentElement?.parentElement as
+              | HTMLElement
+              | null)?.innerText
           ].join(" ")
-        );
+        ).toLowerCase();
 
         let score = 0;
-        if (movie && combined.toLowerCase().includes(movie.toLowerCase())) score += 4;
-        if (row && combined.toLowerCase().includes(row.toLowerCase())) score += 3;
-        if (
-          screenText &&
-          combined.toLowerCase().includes(screenText.toLowerCase())
-        ) {
-          score += 2;
-        }
-        if (combined.includes(time)) score += 1;
 
-        if (!best || score > best.score) {
-          best = { element, score };
+        if (movie && nearby.includes(movie)) score += 4;
+        if (row && nearby.includes(row)) score += 3;
+        if (nearby.includes(time.toLowerCase())) score += 2;
+
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = { element, score };
         }
       }
 
-      if (!best) continue;
+      if (!bestMatch) {
+        continue;
+      }
 
-      const target = best.element;
-      const style = window.getComputedStyle(target);
-      const color = colorNameFromRgb(style.color);
-      const backgroundColor = colorNameFromRgb(style.backgroundColor);
-      const borderColor = colorNameFromRgb(style.borderColor);
+      const style = window.getComputedStyle(bestMatch.element as Element);
       const rawColor = clean(
-        `color=${style.color}; background=${style.backgroundColor}; border=${style.borderColor}`
+        [
+          `color=${style.color}`,
+          `background=${style.backgroundColor}`,
+          `border=${style.borderColor}`,
+          `bucket=${colorBucket(style.color)}`,
+          `bucket=${colorBucket(style.backgroundColor)}`,
+          `bucket=${colorBucket(style.borderColor)}`
+        ].join("; ")
       );
 
-      results.push({
-        id: expectedItem.id,
-        movie: expectedItem.movie,
-        rating: expectedItem.rating,
-        row: expectedItem.row,
-        time: expectedItem.time,
-        screenText: expectedItem.screenText,
-        status: classifyStatus(color, backgroundColor, borderColor),
-        rawColor,
-        label: expectedItem.label
+      result.push({
+        id: item.id,
+        status: classifyStatus(rawColor),
+        rawColor
       });
     }
 
-    const unique = new Map();
-    for (const item of results) {
+    const unique = new Map<string, { id: string; status: StatusKind; rawColor: string }>();
+
+    for (const item of result) {
       if (!unique.has(item.id)) {
         unique.set(item.id, item);
       }
     }
 
-    return Array.from(unique.values()).sort((a: any, b: any) =>
-      a.id.localeCompare(b.id)
-    );
+    return Array.from(unique.values());
   }, items);
+
+  const byId = new Map(statuses.map((item) => [item.id, item]));
+
+  return items.map((item) => {
+    const domStatus = byId.get(item.id);
+
+    if (!domStatus) {
+      return {
+        ...item,
+        label: compactShowtime(item)
+      };
+    }
+
+    return {
+      ...item,
+      status: domStatus.status,
+      rawColor: domStatus.rawColor,
+      label: compactShowtime(item)
+    };
+  });
 }
 
-function decide(previousSnapshot: SnapshotState | null, currentSnapshot: SnapshotState) {
+function decide(
+  previousSnapshot: SnapshotState | null,
+  currentSnapshot: SnapshotState
+): Decision {
   if (
     !previousSnapshot ||
     previousSnapshot.monitorSchemaVersion !== CONFIG.monitorSchemaVersion
@@ -501,28 +584,36 @@ function decide(previousSnapshot: SnapshotState | null, currentSnapshot: Snapsho
   }
 
   const previousById = new Map(
-    previousSnapshot.items.map((item) => [item.id, item])
+    previousSnapshot.items.map((item) => [item.id, item] as const)
   );
-  const currentById = new Map(currentSnapshot.items.map((item) => [item.id, item]));
+  const currentById = new Map(
+    currentSnapshot.items.map((item) => [item.id, item] as const)
+  );
 
   const added = currentSnapshot.items.filter((item) => !previousById.has(item.id));
   const removed = previousSnapshot.items.filter((item) => !currentById.has(item.id));
-  const statusChanged = currentSnapshot.items
-    .map((item) => {
-      const previous = previousById.get(item.id);
-      if (!previous || previous.status === item.status) return null;
+  const statusChanged: StatusChange[] = [];
 
-      return {
-        before: previous,
-        after: item
-      };
-    })
-    .filter(Boolean);
+  for (const item of currentSnapshot.items) {
+    const previousItem = previousById.get(item.id);
+
+    if (!previousItem || previousItem.status === item.status) {
+      continue;
+    }
+
+    statusChanged.push({
+      before: previousItem,
+      after: item
+    });
+  }
 
   if (!added.length && !removed.length && !statusChanged.length) {
     return {
       shouldSendTelegram: false,
-      reason: "No changes."
+      reason: "No timing or status changes.",
+      added,
+      removed,
+      statusChanged
     };
   }
 
@@ -535,43 +626,31 @@ function decide(previousSnapshot: SnapshotState | null, currentSnapshot: Snapsho
   };
 }
 
-function buildTelegramMessage(
-  currentSnapshot: SnapshotState,
-  decision: {
-    added?: ShowtimeSnapshot[];
-    removed?: ShowtimeSnapshot[];
-    statusChanged?: Array<{ before: ShowtimeSnapshot; after: ShowtimeSnapshot }>;
-  }
-) {
-  const lines = [
-    "BMS change detected",
-    "",
-    `Page: ${currentSnapshot.pageTitle || "Unknown page"}`,
-    ""
-  ];
+function buildTelegramMessage(currentSnapshot: SnapshotState, decision: Decision) {
+  const lines = ["BMS change detected", "", `Page: ${currentSnapshot.pageTitle}`, ""];
 
   if (decision.added?.length) {
     lines.push("Added:");
-    decision.added.slice(0, 20).forEach((item) => {
-      lines.push(`+ ${compactSnapshot(item)} (${item.status})`);
-    });
+    for (const item of decision.added.slice(0, 20)) {
+      lines.push(`+ ${compactShowtime(item)} (${item.status})`);
+    }
     lines.push("");
   }
 
   if (decision.removed?.length) {
     lines.push("Removed:");
-    decision.removed.slice(0, 20).forEach((item) => {
-      lines.push(`- ${compactSnapshot(item)}`);
-    });
+    for (const item of decision.removed.slice(0, 20)) {
+      lines.push(`- ${compactShowtime(item)}`);
+    }
     lines.push("");
   }
 
   if (decision.statusChanged?.length) {
     lines.push("Status changed:");
-    decision.statusChanged.slice(0, 20).forEach((item) => {
-      lines.push(`* ${compactSnapshot(item.after)}`);
+    for (const item of decision.statusChanged.slice(0, 20)) {
+      lines.push(`* ${compactShowtime(item.after)}`);
       lines.push(`  ${item.before.status} -> ${item.after.status}`);
-    });
+    }
     lines.push("");
   }
 
@@ -579,47 +658,42 @@ function buildTelegramMessage(
   return lines.join("\n");
 }
 
-function buildShowtimeId(
-  movie: string,
-  row: string,
-  time: string,
-  screenText: string
-) {
-  return `${movie} | ${row} | ${time} | ${screenText}`
+function buildShowtimeId(movie: string, row: string, time: string) {
+  return `${movie} | ${row} | ${time}`
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
 }
 
-function buildSnapshotLabel(item: ShowtimeSnapshot) {
-  return compactSnapshot(item);
-}
+function compactShowtime(item: any) {
+  const row = String(item.row || "").replace(/\s+/g, " ").trim();
+  const time = String(item.time || "").replace(/\s+/g, " ").trim();
+  const screenText = String(item.screenText || "").replace(/\s+/g, " ").trim();
 
-function compactSnapshot(item: ShowtimeSnapshot) {
-  return `${item.movie} - ${item.row || "Unknown row"} | ${item.time}${
-    item.screenText ? ` | ${item.screenText}` : ""
+  return `${item.movie || "Unknown movie"} - ${row} | ${time}${
+    screenText ? ` | ${screenText}` : ""
   }`;
 }
 
 function isBlockedPage(input: {
-  httpStatus: number | null;
+  httpStatus: number;
   pageTitle: string;
   bodyText: string;
 }) {
   const title = String(input.pageTitle || "").toLowerCase();
-  const text = String(input.bodyText || "").toLowerCase();
+  const lowerText = String(input.bodyText || "").toLowerCase();
 
   return (
     input.httpStatus === 403 ||
     title.includes("attention required") ||
     title.includes("just a moment") ||
-    text.includes("sorry, you have been blocked") ||
-    text.includes("you are unable to access bookmyshow.com") ||
-    text.includes("please enable cookies") ||
-    text.includes("cloudflare ray id") ||
-    text.includes("verify you are human") ||
-    text.includes("checking your browser") ||
-    text.includes("captcha")
+    lowerText.includes("sorry, you have been blocked") ||
+    lowerText.includes("you are unable to access bookmyshow.com") ||
+    lowerText.includes("please enable cookies") ||
+    lowerText.includes("cloudflare ray id") ||
+    lowerText.includes("verify you are human") ||
+    lowerText.includes("checking your browser") ||
+    lowerText.includes("captcha")
   );
 }
 
@@ -771,12 +845,9 @@ function decodeBasicHtmlEntities(text: string) {
 }
 
 function normalizeTime(value: string) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toUpperCase();
+  return normalizeText(String(value || "")).toUpperCase();
 }
 
 function dedupeWords(text: string) {
-  return String(text || "").replace(/\s+/g, " ").trim();
+  return normalizeText(String(text || ""));
 }
