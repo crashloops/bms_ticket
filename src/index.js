@@ -68,6 +68,7 @@ const CONFIG = {
 const ACTIVE_WATCH_KEY = "bms:active-watch";
 const SNAPSHOT_KEY_PREFIX = "bms:snapshot:";
 const HISTORY_KEY_PREFIX = "bms:history:";
+const NOTIFY_CHATS_KEY = "bms:notify-chats";
 
 export default {
   async fetch(request, env) {
@@ -943,17 +944,20 @@ async function handleTelegramWebhook(request, env) {
     return jsonResponse({ ok: true, ignored: "no_message_text" });
   }
 
-  if (!isAuthorizedTelegramChat(chatId, env)) {
-    return jsonResponse({ ok: true, ignored: "unauthorized_chat" });
+  if (!isAuthorizedTelegramUser(message, env)) {
+    return jsonResponse({ ok: true, ignored: "unauthorized_user" });
   }
 
-  const replyText = await processTelegramCommand(text, chatId, env);
+  const replyText = await processTelegramCommand(message, env);
   await sendTelegramFromWorker(env, chatId, replyText);
 
   return jsonResponse({ ok: true });
 }
 
-async function processTelegramCommand(text, chatId, env) {
+async function processTelegramCommand(message, env) {
+  const text = String(message?.text || "").trim();
+  const chatId = String(message?.chat?.id || "");
+
   if (text.startsWith("/watch")) {
     const targetUrl = text.replace(/^\/watch\s+/i, "").trim();
 
@@ -1084,6 +1088,53 @@ async function processTelegramCommand(text, chatId, env) {
     ].join("\n");
   }
 
+  if (text === "/notifyhere") {
+    const notifyChats = await readNotificationChats(env);
+    const currentChat = buildNotificationChat(message);
+    const nextNotifyChats = [
+      ...notifyChats.filter((item) => String(item?.chatId || "") !== currentChat.chatId),
+      currentChat
+    ];
+
+    await env.BMS_STATE.put(NOTIFY_CHATS_KEY, JSON.stringify(nextNotifyChats));
+
+    return [
+      "[OK] Notifications enabled here.",
+      "Alerts will be sent to this chat."
+    ].join("\n");
+  }
+
+  if (text === "/unnotifyhere") {
+    const nextNotifyChats = (await readNotificationChats(env)).filter(
+      (item) => String(item?.chatId || "") !== chatId
+    );
+
+    await env.BMS_STATE.put(NOTIFY_CHATS_KEY, JSON.stringify(nextNotifyChats));
+
+    return "[OK] Notifications removed from this chat.";
+  }
+
+  if (text === "/notifystatus") {
+    const notifyChats = await readNotificationChats(env);
+
+    if (!notifyChats.length) {
+      return "No notification chats configured. Falling back to TELEGRAM_CHAT_ID.";
+    }
+
+    return [
+      "Notification chats:",
+      ...notifyChats.map(
+        (item, index) =>
+          `${index + 1}. ${item.title} (${item.type}) - ${item.chatId}`
+      )
+    ].join("\n");
+  }
+
+  if (text === "/notifytest") {
+    await sendWorkerNotification(env, "BMS notification test working.");
+    return "BMS notification test working.";
+  }
+
   if (text === "/help") {
     return [
       "Commands:",
@@ -1091,6 +1142,10 @@ async function processTelegramCommand(text, chatId, env) {
       "/status",
       "/history",
       "/stop",
+      "/notifyhere",
+      "/unnotifyhere",
+      "/notifystatus",
+      "/notifytest",
       "/help"
     ].join("\n");
   }
@@ -1114,8 +1169,34 @@ async function readWorkerJson(env, key) {
   }
 }
 
-function isAuthorizedTelegramChat(chatId, env) {
-  return String(chatId || "") === String(env.TELEGRAM_ADMIN_CHAT_ID || "");
+async function readNotificationChats(env) {
+  const existing = await readWorkerJson(env, NOTIFY_CHATS_KEY);
+  return Array.isArray(existing) ? existing : [];
+}
+
+function buildNotificationChat(message) {
+  const chat = message?.chat || {};
+  const firstName = String(chat.first_name || "").trim();
+  const lastName = String(chat.last_name || "").trim();
+  const title =
+    String(chat.title || "").trim() ||
+    [firstName, lastName].filter(Boolean).join(" ").trim() ||
+    "Unknown chat";
+
+  return {
+    chatId: String(chat.id || "").trim(),
+    type: String(chat.type || "private").trim(),
+    title,
+    addedAt: new Date().toISOString()
+  };
+}
+
+function isAuthorizedTelegramUser(message, env) {
+  const adminId = String(env.TELEGRAM_ADMIN_CHAT_ID || "");
+  const fromId = String(message?.from?.id || "");
+  const chatId = String(message?.chat?.id || "");
+
+  return Boolean(adminId) && (fromId === adminId || chatId === adminId);
 }
 
 function isValidBookMyShowUrl(value) {
@@ -1196,6 +1277,70 @@ async function sendTelegramFromWorker(env, chatId, text) {
     throw new Error(
       `Telegram webhook reply failed: HTTP ${response.status} ${await response.text()}`
     );
+  }
+}
+
+async function getWorkerNotificationChatIds(env) {
+  const notifyChats = await readNotificationChats(env);
+  const ids = notifyChats
+    .map((item) => String(item?.chatId || "").trim())
+    .filter(Boolean);
+
+  if (!ids.length && env.TELEGRAM_CHAT_ID) {
+    ids.push(String(env.TELEGRAM_CHAT_ID).trim());
+  }
+
+  return [...new Set(ids)];
+}
+
+async function sendWorkerNotification(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN secret.");
+  }
+
+  const chatIds = await getWorkerNotificationChatIds(env);
+
+  if (!chatIds.length) {
+    throw new Error("No Telegram notification chat IDs configured.");
+  }
+
+  const failures = [];
+  let successCount = 0;
+
+  for (const targetChatId of chatIds) {
+    const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const response = await fetch(telegramUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: targetChatId,
+        text,
+        disable_web_page_preview: false
+      })
+    });
+
+    if (response.ok) {
+      successCount++;
+      continue;
+    }
+
+    failures.push(
+      `${targetChatId}: HTTP ${response.status} ${(
+        await response.text()
+      ).slice(0, 500)}`
+    );
+  }
+
+  if (successCount === 0) {
+    throw new Error(
+      `Telegram failed for all notification chats: ${failures.join(" | ")}`
+    );
+  }
+
+  if (failures.length) {
+    console.log("Telegram partial failures:", failures);
   }
 }
 

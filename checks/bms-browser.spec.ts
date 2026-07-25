@@ -5,6 +5,7 @@ const CONFIG = {
   activeWatchKey: "bms:active-watch",
   snapshotKeyPrefix: "bms:snapshot:",
   historyKeyPrefix: "bms:history:",
+  notifyChatsKey: "bms:notify-chats",
   monitorSchemaVersion: 6,
   pageSettleMs: 12000
 };
@@ -736,24 +737,105 @@ async function writeKvJson(key: string, value: unknown) {
 }
 
 async function sendTelegram(text: string) {
-  const response = await httpsTextRequest({
-    method: "POST",
-    url: `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: process.env.TELEGRAM_CHAT_ID,
-      text,
-      disable_web_page_preview: false
-    })
+  const chatIds = await getNotificationChatIds();
+
+  if (!chatIds.length) {
+    throw new Error("No Telegram notification chat IDs configured.");
+  }
+
+  const failures: string[] = [];
+  let successCount = 0;
+
+  for (const chatId of chatIds) {
+    const response = await httpsTextRequest({
+      method: "POST",
+      url: `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: false
+      })
+    });
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      successCount++;
+    } else {
+      failures.push(
+        `${maskChatId(chatId)}: HTTP ${response.statusCode} ${response.body}`
+      );
+    }
+  }
+
+  console.log("Telegram send result:", {
+    targetCount: chatIds.length,
+    successCount,
+    failureCount: failures.length
   });
 
-  if (response.statusCode < 200 || response.statusCode >= 300) {
+  if (failures.length) {
+    console.log("Telegram send failures:", failures);
+  }
+
+  if (successCount === 0) {
     throw new Error(
-      `Telegram failed: HTTP ${response.statusCode} ${response.body}`
+      `Telegram failed for all notification chats: ${failures.join(" | ")}`
     );
   }
+}
+
+async function getNotificationChatIds() {
+  let raw: any = null;
+
+  try {
+    raw = await readKvJson(CONFIG.notifyChatsKey);
+  } catch (error) {
+    console.log("Could not read notification chats from KV. Falling back if possible.", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+
+  let notifyChats: any[] = [];
+
+  if (Array.isArray(raw)) {
+    notifyChats = raw;
+  } else if (raw && Array.isArray(raw.chats)) {
+    notifyChats = raw.chats;
+  } else if (raw && Array.isArray(raw.notifyChats)) {
+    notifyChats = raw.notifyChats;
+  } else if (raw && raw.chatId) {
+    notifyChats = [raw];
+  }
+
+  const ids = notifyChats
+    .map((x) => String(x.chatId || x.id || "").trim())
+    .filter(Boolean);
+
+  if (!ids.length && process.env.TELEGRAM_CHAT_ID) {
+    ids.push(String(process.env.TELEGRAM_CHAT_ID).trim());
+  }
+
+  const uniqueIds = [...new Set(ids)];
+
+  console.log("Telegram notification target count:", uniqueIds.length);
+  console.log(
+    "Telegram notification target types:",
+    notifyChats.map((x) => ({
+      type: x.type || "unknown",
+      title: x.title || x.firstName || "unknown",
+      hasChatId: Boolean(x.chatId || x.id)
+    }))
+  );
+
+  return uniqueIds;
+}
+
+function maskChatId(chatId: string) {
+  const value = String(chatId || "");
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 3)}***${value.slice(-4)}`;
 }
 
 function httpsTextRequest(input: {
