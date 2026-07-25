@@ -66,6 +66,7 @@ const CONFIG = {
 };
 
 const ACTIVE_WATCH_KEY = "bms:active-watch";
+const WATCHES_KEY = "bms:watches";
 const SNAPSHOT_KEY_PREFIX = "bms:snapshot:";
 const HISTORY_KEY_PREFIX = "bms:history:";
 const NOTIFY_CHATS_KEY = "bms:notify-chats";
@@ -958,75 +959,102 @@ async function processTelegramCommand(message, env) {
   const text = String(message?.text || "").trim();
   const chatId = String(message?.chat?.id || "");
 
-  if (text.startsWith("/watch")) {
-    const targetUrl = text.replace(/^\/watch\s+/i, "").trim();
+  if (text.startsWith("/addwatch")) {
+    const match = text.match(/^\/addwatch\s+(\S+)\s+(\S+)$/i);
 
-    if (!targetUrl) {
+    if (!match) {
       return [
         "Usage:",
-        "/watch https://in.bookmyshow.com/..."
+        "/addwatch <alias> <BookMyShow URL>"
       ].join("\n");
+    }
+
+    const alias = normalizeWatchAlias(match[1]);
+    const targetUrl = String(match[2] || "").trim();
+
+    if (!alias) {
+      return "Invalid alias. Use lowercase letters, numbers, hyphens, or underscores with no spaces.";
     }
 
     if (!isValidBookMyShowUrl(targetUrl)) {
       return "Invalid URL. It must start with https://in.bookmyshow.com/";
     }
 
+    const watches = await readWatchList(env);
     const now = new Date().toISOString();
-    const watchId = Date.now().toString(36);
-    const watch = {
-      active: true,
-      watchId,
+    const nextWatch = {
+      watchId: createWatchId(),
+      alias,
       targetUrl,
+      active: true,
       mode: "all_movies",
       createdAt: now,
       updatedAt: now,
       createdByChatId: chatId
     };
 
-    await env.BMS_STATE.put(ACTIVE_WATCH_KEY, JSON.stringify(watch));
+    const nextWatches = [
+      ...watches.filter((watch) => watch.alias !== alias),
+      nextWatch
+    ].sort((left, right) => left.alias.localeCompare(right.alias));
+
+    await writeWatchList(env, nextWatches);
 
     return [
-      "[OK] Watch saved.",
+      `[OK] Watch added: ${alias}`,
       "Baseline will be created silently on the next Checkly run."
     ].join("\n");
   }
 
-  if (text === "/status") {
-    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+  if (text === "/listwatches") {
+    const watches = await readWatchList(env);
 
-    if (!watch) {
-      return "No active watch.";
+    if (!watches.length) {
+      return "No watches configured.";
     }
 
-    const snapshot = await readWorkerJson(
-      env,
-      `${SNAPSHOT_KEY_PREFIX}${watch.watchId}`
+    const snapshots = await Promise.all(
+      watches.map((watch) => readWorkerJson(env, `${SNAPSHOT_KEY_PREFIX}${watch.watchId}`))
     );
 
-    const lines = [
-      "Active watch:",
-      `URL: ${watch.targetUrl}`,
-      `Watch ID: ${watch.watchId}`,
-      `Active: ${Boolean(watch.active)}`,
-      `Last checked: ${snapshot?.checkedAt || "Not checked yet"}`,
-      `Last show count: ${
-        snapshot?.showCount === undefined ? "Unknown" : snapshot.showCount
-      }`,
-      "Use /history to see the last 5 checks."
-    ];
-
-    if (watch.active === false) {
-      lines.push(
-        "Monitoring is stopped. Send /watch <BookMyShow URL> to restart."
-      );
-    }
-
-    return lines.join("\n");
+    return [
+      "Watches:",
+      ...watches.map((watch, index) =>
+        formatWatchSummaryLine(index, watch, snapshots[index])
+      )
+    ].join("\n");
   }
 
-  if (text === "/history") {
-    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+  if (text === "/status") {
+    const watches = await readWatchList(env);
+
+    if (!watches.length) {
+      return "No watches configured.";
+    }
+
+    const snapshots = await Promise.all(
+      watches.map((watch) => readWorkerJson(env, `${SNAPSHOT_KEY_PREFIX}${watch.watchId}`))
+    );
+
+    return [
+      "Watches:",
+      ...watches.map((watch, index) =>
+        formatWatchSummaryLine(index, watch, snapshots[index])
+      ),
+      "Use /history <alias> for the last 5 checks."
+    ].join("\n");
+  }
+
+  if (text.startsWith("/history")) {
+    const watches = await readWatchList(env);
+    const aliasText = text.replace(/^\/history\b/i, "").trim();
+    const resolvedWatch = resolveWatchForAlias(watches, aliasText);
+
+    if (!resolvedWatch.ok) {
+      return resolvedWatch.message;
+    }
+
+    const watch = resolvedWatch.watch;
 
     if (!watch || !watch.watchId) {
       return "No watch history found.";
@@ -1042,7 +1070,7 @@ async function processTelegramCommand(message, env) {
     }
 
     return [
-      "Last 5 checks:",
+      `Last 5 checks for ${watch.alias}:`,
       ...history.slice(0, 5).map((entry, index) => {
         const parts = [
           `${index + 1}. ${formatHistoryTime(entry.checkedAt)} - ${entry.status}`,
@@ -1068,23 +1096,104 @@ async function processTelegramCommand(message, env) {
     ].join("\n");
   }
 
-  if (text === "/stop") {
-    const watch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
-
-    if (!watch || watch.active !== true) {
-      return "No active watch to stop.";
+  if (text.startsWith("/pausewatch")) {
+    const alias = normalizeWatchAlias(text.replace(/^\/pausewatch\s+/i, "").trim());
+    if (!alias) {
+      return [
+        "Usage:",
+        "/pausewatch <alias>"
+      ].join("\n");
     }
 
-    const nextWatch = {
+    const watches = await readWatchList(env);
+    const watch = watches.find((item) => item.alias === alias);
+
+    if (!watch) {
+      return `Watch not found: ${alias}`;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const nextWatches = watches.map((item) =>
+      item.alias === alias ? { ...item, active: false, updatedAt } : item
+    );
+
+    await writeWatchList(env, nextWatches);
+    return `[OK] Watch paused: ${alias}`;
+  }
+
+  if (text.startsWith("/resumewatch")) {
+    const alias = normalizeWatchAlias(text.replace(/^\/resumewatch\s+/i, "").trim());
+    if (!alias) {
+      return [
+        "Usage:",
+        "/resumewatch <alias>"
+      ].join("\n");
+    }
+
+    const watches = await readWatchList(env);
+    const watch = watches.find((item) => item.alias === alias);
+
+    if (!watch) {
+      return `Watch not found: ${alias}`;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const nextWatches = watches.map((item) =>
+      item.alias === alias
+        ? {
+            ...item,
+            active: true,
+            watchId: createWatchId(),
+            updatedAt
+          }
+        : item
+    );
+
+    await writeWatchList(env, nextWatches);
+    return [
+      `[OK] Watch resumed: ${alias}`,
+      "Baseline will be created silently on the next Checkly run."
+    ].join("\n");
+  }
+
+  if (text.startsWith("/removewatch")) {
+    const alias = normalizeWatchAlias(text.replace(/^\/removewatch\s+/i, "").trim());
+    if (!alias) {
+      return [
+        "Usage:",
+        "/removewatch <alias>"
+      ].join("\n");
+    }
+
+    const watches = await readWatchList(env);
+    const nextWatches = watches.filter((item) => item.alias !== alias);
+
+    if (nextWatches.length === watches.length) {
+      return `Watch not found: ${alias}`;
+    }
+
+    await writeWatchList(env, nextWatches);
+    return `[OK] Watch removed: ${alias}`;
+  }
+
+  if (text === "/stop") {
+    const watches = await readWatchList(env);
+
+    if (!watches.length) {
+      return "No watches configured.";
+    }
+
+    const updatedAt = new Date().toISOString();
+    const nextWatches = watches.map((watch) => ({
       ...watch,
       active: false,
-      updatedAt: new Date().toISOString()
-    };
+      updatedAt
+    }));
 
-    await env.BMS_STATE.put(ACTIVE_WATCH_KEY, JSON.stringify(nextWatch));
+    await writeWatchList(env, nextWatches);
     return [
-      "[OK] Watch stopped.",
-      "Checkly will exit early until you send a new /watch link."
+      "[OK] All watches paused.",
+      "Checkly will exit early until you resume or add a watch."
     ].join("\n");
   }
 
@@ -1138,9 +1247,13 @@ async function processTelegramCommand(message, env) {
   if (text === "/help") {
     return [
       "Commands:",
-      "/watch <BookMyShow URL>",
+      "/addwatch <alias> <BookMyShow URL>",
+      "/listwatches",
       "/status",
-      "/history",
+      "/history <alias>",
+      "/pausewatch <alias>",
+      "/resumewatch <alias>",
+      "/removewatch <alias>",
       "/stop",
       "/notifyhere",
       "/unnotifyhere",
@@ -1167,6 +1280,103 @@ async function readWorkerJson(env, key) {
   } catch {
     return null;
   }
+}
+
+async function readWatchList(env) {
+  const stored = await readWorkerJson(env, WATCHES_KEY);
+  let watches = [];
+
+  if (Array.isArray(stored)) {
+    watches = stored;
+  } else if (stored && Array.isArray(stored.watches)) {
+    watches = stored.watches;
+  }
+
+  if (!watches.length) {
+    const legacyWatch = await readWorkerJson(env, ACTIVE_WATCH_KEY);
+    if (legacyWatch?.targetUrl) {
+      watches = [legacyWatch];
+    }
+  }
+
+  return watches
+    .map((watch, index) => normalizeStoredWatch(watch, index))
+    .filter(Boolean);
+}
+
+async function writeWatchList(env, watches) {
+  await env.BMS_STATE.put(WATCHES_KEY, JSON.stringify(watches));
+}
+
+function normalizeStoredWatch(watch, index) {
+  const targetUrl = String(watch?.targetUrl || "").trim();
+  if (!targetUrl) return null;
+
+  return {
+    watchId: String(watch?.watchId || `legacy-watch-${index + 1}`),
+    alias: normalizeWatchAlias(watch?.alias) || `watch${index + 1}`,
+    targetUrl,
+    active: watch?.active !== false,
+    mode: "all_movies",
+    createdAt: String(watch?.createdAt || new Date().toISOString()),
+    updatedAt: String(watch?.updatedAt || new Date().toISOString()),
+    createdByChatId: String(watch?.createdByChatId || "")
+  };
+}
+
+function normalizeWatchAlias(value) {
+  const alias = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]/g, "");
+
+  return alias;
+}
+
+function createWatchId() {
+  return `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function resolveWatchForAlias(watches, aliasText) {
+  if (!watches.length) {
+    return {
+      ok: false,
+      message: "No watches configured."
+    };
+  }
+
+  const alias = normalizeWatchAlias(aliasText);
+
+  if (!alias) {
+    if (watches.length === 1) {
+      return { ok: true, watch: watches[0] };
+    }
+
+    return {
+      ok: false,
+      message: "Multiple watches configured. Use /history <alias>."
+    };
+  }
+
+  const watch = watches.find((item) => item.alias === alias);
+
+  if (!watch) {
+    return {
+      ok: false,
+      message: `Watch not found: ${alias}`
+    };
+  }
+
+  return { ok: true, watch };
+}
+
+function formatWatchSummaryLine(index, watch, snapshot) {
+  return `${index + 1}. ${watch.alias} - ${
+    watch.active ? "active" : "paused"
+  } - last checked: ${
+    snapshot?.checkedAt ? formatHistoryTime(snapshot.checkedAt) : "Not checked yet"
+  } - shows: ${snapshot?.showCount ?? "Unknown"}`;
 }
 
 async function readNotificationChats(env) {

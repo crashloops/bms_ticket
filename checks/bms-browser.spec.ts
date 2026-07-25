@@ -2,6 +2,7 @@ import { test } from "@playwright/test";
 import * as https from "https";
 
 const CONFIG = {
+  watchesKey: "bms:watches",
   activeWatchKey: "bms:active-watch",
   snapshotKeyPrefix: "bms:snapshot:",
   historyKeyPrefix: "bms:history:",
@@ -24,9 +25,10 @@ type StatusKind =
   | "housefull_or_unavailable"
   | "unknown";
 
-type ActiveWatch = {
+type WatchConfig = {
   active: boolean;
   watchId: string;
+  alias: string;
   targetUrl: string;
   mode: "all_movies";
   createdAt: string;
@@ -48,6 +50,7 @@ type ShowtimeSnapshot = {
 
 type SnapshotState = {
   monitorSchemaVersion: number;
+  alias: string;
   watchId: string;
   targetUrl: string;
   pageTitle: string;
@@ -115,138 +118,68 @@ test.setTimeout(90000);
 test("Monitor BookMyShow listing changes", async ({ page }) => {
   validateEnv();
 
-  const activeWatch = await readActiveWatch();
-  if (!activeWatch) {
-    console.log("No active watch. Exiting.");
+  const activeWatches = await readActiveWatches();
+  if (!activeWatches.length) {
+    console.log("No active watches. Exiting.");
     return;
   }
 
-  if (activeWatch.active !== true) {
-    console.log("Active watch is stopped. Exiting.");
-    return;
+  for (const watch of activeWatches) {
+    await runSingleWatch(page, watch);
   }
-
-  const checkedAt = new Date().toISOString();
-  const snapshotKey = snapshotKeyForWatch(activeWatch.watchId);
-  const previousSnapshot = await readKvJson<SnapshotState>(snapshotKey);
-
-  const response = await page.goto(activeWatch.targetUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 45000
-  });
-
-  const httpStatus = response ? response.status() : 0;
-
-  await page.waitForTimeout(CONFIG.pageSettleMs);
-
-  try {
-    await page.waitForLoadState("networkidle", { timeout: 10000 });
-  } catch {
-    // Some pages never become fully network-idle. Continue.
-  }
-
-  const pageTitle = await page.title();
-  const bodyText = await page.locator("body").innerText({ timeout: 15000 });
-  const extractedShowtimes = await extractAllShowtimesFromPage(page, bodyText);
-
-  const pageBlocked = isBlockedPage({
-    httpStatus,
-    pageTitle,
-    bodyText
-  });
-  const pageUsableForMonitoring =
-    httpStatus >= 200 &&
-    httpStatus < 400 &&
-    !pageBlocked &&
-    extractedShowtimes.length > 0;
-
-  if (!pageUsableForMonitoring) {
-    const reason = pageBlocked
-      ? "Page blocked or unusable."
-      : "No readable showtimes found.";
-
-    await appendCheckHistory(activeWatch.watchId, {
-      checkedAt,
-      status: "blocked_or_unusable",
-      httpStatus,
-      pageTitle,
-      targetUrl: activeWatch.targetUrl,
-      showCount: extractedShowtimes.length,
-      alertSent: false,
-      reason,
-      addedCount: 0,
-      removedCount: 0,
-      statusChangedCount: 0
-    });
-
-    console.log(
-      JSON.stringify(
-        {
-          targetUrl: activeWatch.targetUrl,
-          pageTitle,
-          httpStatus,
-          showtimeCount: extractedShowtimes.length,
-          reason
-        },
-        null,
-        2
-      )
-    );
-    return;
-  }
-
-  const currentSnapshot: SnapshotState = {
-    monitorSchemaVersion: CONFIG.monitorSchemaVersion,
-    watchId: activeWatch.watchId,
-    targetUrl: activeWatch.targetUrl,
-    pageTitle,
-    checkedAt,
-    showCount: extractedShowtimes.length,
-    items: extractedShowtimes
-  };
-
-  const decision = decide(previousSnapshot, currentSnapshot);
-
-  await appendCheckHistory(activeWatch.watchId, {
-    checkedAt,
-    status: "readable",
-    httpStatus,
-    pageTitle,
-    targetUrl: activeWatch.targetUrl,
-    showCount: currentSnapshot.showCount,
-    alertSent: decision.shouldSendTelegram === true,
-    reason: decision.reason,
-    addedCount: decision.added?.length || 0,
-    removedCount: decision.removed?.length || 0,
-    statusChangedCount: decision.statusChanged?.length || 0
-  });
-
-  console.log(
-    JSON.stringify(
-      {
-        targetUrl: activeWatch.targetUrl,
-        pageTitle,
-        httpStatus,
-        showtimeCount: currentSnapshot.showCount,
-        decisionReason: decision.reason,
-        addedCount: decision.added?.length || 0,
-        removedCount: decision.removed?.length || 0,
-        statusChangedCount: decision.statusChanged?.length || 0
-      },
-      null,
-      2
-    )
-  );
-
-  if (decision.shouldSendTelegram) {
-    await sendTelegram(buildTelegramMessage(currentSnapshot, decision));
-  }
-
-  await writeKvJson(snapshotKey, currentSnapshot);
 });
 
-async function readActiveWatch() {
-  return readKvJson<ActiveWatch>(CONFIG.activeWatchKey);
+async function readWatches() {
+  const raw = await readKvJson<any>(CONFIG.watchesKey);
+  let watches: any[] = [];
+
+  if (Array.isArray(raw)) {
+    watches = raw;
+  } else if (raw && Array.isArray(raw.watches)) {
+    watches = raw.watches;
+  }
+
+  if (!watches.length) {
+    const legacyWatch = await readKvJson<any>(CONFIG.activeWatchKey);
+    if (legacyWatch?.targetUrl) {
+      watches = [legacyWatch];
+    }
+  }
+
+  return watches
+    .map((watch, index) => normalizeWatch(watch, index))
+    .filter(Boolean) as WatchConfig[];
+}
+
+async function readActiveWatches() {
+  const watches = await readWatches();
+  return watches.filter((watch) => watch.active === true);
+}
+
+function normalizeWatch(watch: any, index: number): WatchConfig | null {
+  const targetUrl = String(watch?.targetUrl || "").trim();
+  if (!targetUrl) return null;
+
+  return {
+    active: watch?.active !== false,
+    watchId: String(watch?.watchId || `legacy-watch-${index + 1}`),
+    alias: normalizeWatchAlias(watch?.alias, index),
+    targetUrl,
+    mode: "all_movies",
+    createdAt: String(watch?.createdAt || new Date().toISOString()),
+    updatedAt: String(watch?.updatedAt || new Date().toISOString()),
+    createdByChatId: String(watch?.createdByChatId || "")
+  };
+}
+
+function normalizeWatchAlias(value: unknown, index: number) {
+  const alias = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]/g, "");
+
+  return alias || `watch${index + 1}`;
 }
 
 function snapshotKeyForWatch(watchId: string) {
@@ -270,6 +203,173 @@ async function appendCheckHistory(watchId: string, entry: any) {
   history = history.slice(0, 5);
 
   await writeKvJson(key, history);
+}
+
+async function runSingleWatch(page: any, watch: WatchConfig) {
+  const checkedAt = new Date().toISOString();
+  const snapshotKey = snapshotKeyForWatch(watch.watchId);
+  const previousSnapshot = await readKvJson<SnapshotState>(snapshotKey);
+
+  let httpStatus = 0;
+  let pageTitle = "";
+  let bodyText = "";
+  let extractedShowtimes: ShowtimeSnapshot[] = [];
+
+  try {
+    const response = await page.goto(watch.targetUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000
+    });
+
+    httpStatus = response ? response.status() : 0;
+
+    await page.waitForTimeout(CONFIG.pageSettleMs);
+
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 10000 });
+    } catch {
+      // Some pages never become fully network-idle. Continue.
+    }
+
+    pageTitle = await page.title();
+    bodyText = await page.locator("body").innerText({ timeout: 15000 });
+    extractedShowtimes = await extractAllShowtimesFromPage(page, bodyText);
+  } catch (error) {
+    const reason = `Watch run failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+
+    await appendCheckHistory(watch.watchId, {
+      checkedAt,
+      alias: watch.alias,
+      watchId: watch.watchId,
+      status: "blocked_or_unusable",
+      httpStatus,
+      pageTitle,
+      targetUrl: watch.targetUrl,
+      showCount: 0,
+      alertSent: false,
+      reason,
+      addedCount: 0,
+      removedCount: 0,
+      statusChangedCount: 0
+    });
+
+    console.log(
+      JSON.stringify(
+        {
+          alias: watch.alias,
+          targetUrl: watch.targetUrl,
+          reason
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  const pageBlocked = isBlockedPage({
+    httpStatus,
+    pageTitle,
+    bodyText
+  });
+  const pageUsableForMonitoring =
+    httpStatus >= 200 &&
+    httpStatus < 400 &&
+    !pageBlocked &&
+    extractedShowtimes.length > 0;
+
+  if (!pageUsableForMonitoring) {
+    const reason = pageBlocked
+      ? "Page blocked or unusable."
+      : "No readable showtimes found.";
+
+    await appendCheckHistory(watch.watchId, {
+      checkedAt,
+      alias: watch.alias,
+      watchId: watch.watchId,
+      status: "blocked_or_unusable",
+      httpStatus,
+      pageTitle,
+      targetUrl: watch.targetUrl,
+      showCount: extractedShowtimes.length,
+      alertSent: false,
+      reason,
+      addedCount: 0,
+      removedCount: 0,
+      statusChangedCount: 0
+    });
+
+    console.log(
+      JSON.stringify(
+        {
+          alias: watch.alias,
+          targetUrl: watch.targetUrl,
+          pageTitle,
+          httpStatus,
+          showtimeCount: extractedShowtimes.length,
+          reason
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  const currentSnapshot: SnapshotState = {
+    monitorSchemaVersion: CONFIG.monitorSchemaVersion,
+    alias: watch.alias,
+    watchId: watch.watchId,
+    targetUrl: watch.targetUrl,
+    pageTitle,
+    checkedAt,
+    showCount: extractedShowtimes.length,
+    items: extractedShowtimes
+  };
+
+  const decision = decide(previousSnapshot, currentSnapshot);
+
+  await appendCheckHistory(watch.watchId, {
+    checkedAt,
+    alias: watch.alias,
+    watchId: watch.watchId,
+    status: "readable",
+    httpStatus,
+    pageTitle,
+    targetUrl: watch.targetUrl,
+    showCount: currentSnapshot.showCount,
+    alertSent: decision.shouldSendTelegram === true,
+    reason: decision.reason,
+    addedCount: decision.added?.length || 0,
+    removedCount: decision.removed?.length || 0,
+    statusChangedCount: decision.statusChanged?.length || 0
+  });
+
+  console.log(
+    JSON.stringify(
+      {
+        alias: watch.alias,
+        targetUrl: watch.targetUrl,
+        pageTitle,
+        httpStatus,
+        showtimeCount: currentSnapshot.showCount,
+        decisionReason: decision.reason,
+        addedCount: decision.added?.length || 0,
+        removedCount: decision.removed?.length || 0,
+        statusChangedCount: decision.statusChanged?.length || 0
+      },
+      null,
+      2
+    )
+  );
+
+  if (decision.shouldSendTelegram) {
+    await sendTelegram(buildTelegramMessage(currentSnapshot, decision));
+  }
+
+  await writeKvJson(snapshotKey, currentSnapshot);
 }
 
 async function extractAllShowtimesFromPage(page: any, bodyText: string) {
@@ -667,7 +767,13 @@ function decide(
 }
 
 function buildTelegramMessage(currentSnapshot: SnapshotState, decision: Decision) {
-  const lines = ["BMS change detected", "", `Page: ${currentSnapshot.pageTitle}`, ""];
+  const lines = [
+    "BMS change detected",
+    "",
+    `Watch: ${currentSnapshot.alias}`,
+    `Page: ${currentSnapshot.pageTitle}`,
+    ""
+  ];
 
   if (decision.added?.length) {
     lines.push("Added:");
