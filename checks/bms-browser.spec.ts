@@ -7,7 +7,7 @@ const CONFIG = {
   snapshotKeyPrefix: "bms:snapshot:",
   historyKeyPrefix: "bms:history:",
   notifyChatsKey: "bms:notify-chats",
-  monitorSchemaVersion: 7,
+  monitorSchemaVersion: 11,
   pageSettleMs: 12000
 };
 
@@ -38,6 +38,11 @@ type WatchConfig = {
 
 type ShowtimeSnapshot = {
   id: string;
+  baseKey?: string;
+  occurrence?: number;
+  originalPageIndex?: number;
+  duplicateChangeCount?: number;
+  colorBucket?: string;
   movie: string;
   rating: string;
   row: string;
@@ -60,8 +65,10 @@ type SnapshotState = {
 };
 
 type StatusChange = {
-  before: ShowtimeSnapshot;
-  after: ShowtimeSnapshot;
+  previous: ShowtimeSnapshot;
+  current: ShowtimeSnapshot;
+  oldStatus: string;
+  newStatus: string;
 };
 
 type Decision = {
@@ -70,6 +77,12 @@ type Decision = {
   added?: ShowtimeSnapshot[];
   removed?: ShowtimeSnapshot[];
   statusChanged?: StatusChange[];
+  colorChanged?: Array<{
+    previous: ShowtimeSnapshot;
+    current: ShowtimeSnapshot;
+    oldColorBucket: string;
+    newColorBucket: string;
+  }>;
 };
 
 function validateEnv() {
@@ -186,6 +199,16 @@ function snapshotKeyForWatch(watchId: string) {
   return `${CONFIG.snapshotKeyPrefix}${watchId}`;
 }
 
+function hasMatchingSchemaVersion(
+  previousSnapshot: SnapshotState | null,
+  currentSnapshot: SnapshotState
+) {
+  return (
+    Number(previousSnapshot?.monitorSchemaVersion || 0) ===
+    Number(currentSnapshot.monitorSchemaVersion || 0)
+  );
+}
+
 async function appendCheckHistory(watchId: string, entry: any) {
   const key = `${CONFIG.historyKeyPrefix}${watchId}`;
   let history: any[] = [];
@@ -252,7 +275,8 @@ async function runSingleWatch(page: any, watch: WatchConfig) {
       reason,
       addedCount: 0,
       removedCount: 0,
-      statusChangedCount: 0
+      statusChangedCount: 0,
+      colorChangedCount: 0
     });
 
     console.log(
@@ -298,7 +322,8 @@ async function runSingleWatch(page: any, watch: WatchConfig) {
       reason,
       addedCount: 0,
       removedCount: 0,
-      statusChangedCount: 0
+      statusChangedCount: 0,
+      colorChangedCount: 0
     });
 
     console.log(
@@ -329,7 +354,71 @@ async function runSingleWatch(page: any, watch: WatchConfig) {
     items: extractedShowtimes
   };
 
-  const decision = decide(previousSnapshot, currentSnapshot);
+  if (
+    !previousSnapshot ||
+    !hasMatchingSchemaVersion(previousSnapshot, currentSnapshot)
+  ) {
+    const reason = !previousSnapshot
+      ? "No previous snapshot. Baseline created silently."
+      : "Schema changed. Baseline refreshed silently.";
+
+    await writeKvJson(snapshotKey, currentSnapshot);
+
+    await appendCheckHistory(watch.watchId, {
+      checkedAt,
+      alias: watch.alias,
+      watchId: watch.watchId,
+      status: "readable",
+      httpStatus,
+      pageTitle,
+      targetUrl: watch.targetUrl,
+      showCount: currentSnapshot.showCount,
+      alertSent: false,
+      reason,
+      addedCount: 0,
+      removedCount: 0,
+      statusChangedCount: 0,
+      colorChangedCount: 0
+    });
+
+    return;
+  }
+
+  console.log("Color comparison debug:", {
+    alias: watch.alias,
+    previousSchema: previousSnapshot?.monitorSchemaVersion,
+    currentSchema: currentSnapshot.monitorSchemaVersion,
+    colorComparisons: (currentSnapshot.items || []).map((current) => {
+      const previous = findPreviousComparableItem(previousSnapshot.items || [], current);
+      return {
+        label: current.label,
+        previousColorBucket: previous?.colorBucket,
+        currentColorBucket: current.colorBucket,
+        wouldAlert:
+          previous?.colorBucket === "grey_like" &&
+          ["green_like", "yellow_like", "orange_like", "red_like", "non_grey"].includes(
+            String(current.colorBucket || "")
+          )
+      };
+    })
+  });
+
+  const diff = compareSnapshots(previousSnapshot, currentSnapshot);
+
+  console.log("Diff summary:", {
+    alias: watch.alias,
+    addedCount: diff.addedCount,
+    removedCount: diff.removedCount,
+    statusChangedCount: diff.statusChangedCount,
+    colorChangedCount: diff.colorChangedCount,
+    changed: diff.changed
+  });
+
+  if (diff.changed) {
+    await sendTelegram(buildTelegramMessage(currentSnapshot, diff));
+  }
+
+  await writeKvJson(snapshotKey, currentSnapshot);
 
   await appendCheckHistory(watch.watchId, {
     checkedAt,
@@ -340,36 +429,15 @@ async function runSingleWatch(page: any, watch: WatchConfig) {
     pageTitle,
     targetUrl: watch.targetUrl,
     showCount: currentSnapshot.showCount,
-    alertSent: decision.shouldSendTelegram === true,
-    reason: decision.reason,
-    addedCount: decision.added?.length || 0,
-    removedCount: decision.removed?.length || 0,
-    statusChangedCount: decision.statusChanged?.length || 0
+    alertSent: diff.changed,
+    reason: diff.changed
+      ? "Added, removed, status, or color changes detected."
+      : "No timing, status, or color changes.",
+    addedCount: diff.addedCount || 0,
+    removedCount: diff.removedCount || 0,
+    statusChangedCount: diff.statusChangedCount || 0,
+    colorChangedCount: diff.colorChangedCount || 0
   });
-
-  console.log(
-    JSON.stringify(
-      {
-        alias: watch.alias,
-        targetUrl: watch.targetUrl,
-        pageTitle,
-        httpStatus,
-        showtimeCount: currentSnapshot.showCount,
-        decisionReason: decision.reason,
-        addedCount: decision.added?.length || 0,
-        removedCount: decision.removed?.length || 0,
-        statusChangedCount: decision.statusChanged?.length || 0
-      },
-      null,
-      2
-    )
-  );
-
-  if (decision.shouldSendTelegram) {
-    await sendTelegram(buildTelegramMessage(currentSnapshot, decision));
-  }
-
-  await writeKvJson(snapshotKey, currentSnapshot);
 }
 
 async function extractAllShowtimesFromPage(page: any, bodyText: string) {
@@ -423,15 +491,7 @@ function extractAllShowtimesFromText(bodyText: string) {
     });
   }
 
-  const rawResults: Array<
-    Omit<ShowtimeSnapshot, "id"> & {
-      movie: string;
-      rating: string;
-      row: string;
-      time: string;
-      screenText: string;
-    }
-  > = [];
+  const rawResults: ShowtimeSnapshot[] = [];
 
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
@@ -482,6 +542,7 @@ function extractAllShowtimesFromText(bodyText: string) {
       );
 
       rawResults.push({
+        id: "",
         movie: marker.movie,
         rating: marker.rating,
         row,
@@ -489,6 +550,7 @@ function extractAllShowtimesFromText(bodyText: string) {
         screenText,
         status: "unknown",
         rawColor: "",
+        originalPageIndex: rawResults.length,
         label: compactShowtime({
           movie: marker.movie,
           row,
@@ -499,56 +561,23 @@ function extractAllShowtimesFromText(bodyText: string) {
     }
   }
 
-  const duplicateCounters = new Map<string, number>();
-  const finalResults: ShowtimeSnapshot[] = [];
+  const sortedResults = rawResults
+    .map((item) => {
+      const cleanScreen = cleanScreenText(item.screenText);
+      return {
+        ...item,
+        screenText: cleanScreen,
+        label: compactShowtime({
+          movie: item.movie,
+          row: item.row,
+          time: item.time,
+          screenText: cleanScreen
+        })
+      };
+    })
+    .sort(compareShowItems);
 
-  for (const item of rawResults) {
-    const cleanScreen = cleanScreenText(item.screenText);
-    const duplicateBase = `${normalizeKeyPart(item.movie)} | ${normalizeKeyPart(
-      item.row
-    )} | ${normalizeKeyPart(item.time)}`;
-
-    const needsDuplicateSlot = !normalizeScreenKey(cleanScreen);
-    let duplicateSlot = 0;
-
-    if (needsDuplicateSlot) {
-      const nextCount = (duplicateCounters.get(duplicateBase) || 0) + 1;
-      duplicateCounters.set(duplicateBase, nextCount);
-      duplicateSlot = nextCount;
-    }
-
-    const id = buildShowtimeId(
-      item.movie,
-      item.row,
-      item.time,
-      cleanScreen,
-      duplicateSlot
-    );
-
-    finalResults.push({
-      ...item,
-      id,
-      screenText: cleanScreen,
-      label: compactShowtime({
-        movie: item.movie,
-        row: item.row,
-        time: item.time,
-        screenText: cleanScreen
-      })
-    });
-  }
-
-  const unique = new Map<string, ShowtimeSnapshot>();
-
-  for (const item of finalResults) {
-    if (!unique.has(item.id)) {
-      unique.set(item.id, item);
-    }
-  }
-
-  return [...unique.values()].sort((left, right) =>
-    left.id.localeCompare(right.id)
-  );
+  return assignOccurrenceIds(sortedResults);
 }
 
 async function extractShowtimeStatusesFromDom(
@@ -557,164 +586,221 @@ async function extractShowtimeStatusesFromDom(
 ): Promise<ShowtimeSnapshot[]> {
   if (!items.length) return [];
 
-  const statuses = await page.evaluate((expected: ShowtimeSnapshot[]) => {
-    function clean(value: unknown) {
+  const domChips = await page.evaluate(() => {
+    function normalizeText(value: unknown) {
       return String(value || "").replace(/\s+/g, " ").trim();
     }
 
-    function colorBucket(value: string) {
-      const raw = String(value || "").toLowerCase();
-      const match = raw.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    function isVisibleElement(el: Element) {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
 
-      if (!match) return raw;
-
-      const red = Number(match[1]);
-      const green = Number(match[2]);
-      const blue = Number(match[3]);
-
-      if (green >= 120 && red <= 140) return "green_like";
-      if (red >= 180 && green >= 120 && blue <= 140) {
-        return "yellow_or_orange_like";
-      }
-      if (
-        red >= 120 &&
-        green >= 120 &&
-        blue >= 120 &&
-        Math.abs(red - green) <= 35 &&
-        Math.abs(green - blue) <= 35
-      ) {
-        return "grey_like";
-      }
-
-      return raw;
-    }
-
-    function classifyStatus(rawColor: string): StatusKind {
-      const lower = rawColor.toLowerCase();
-
-      if (lower.includes("green_like")) return "available";
-      if (lower.includes("yellow_or_orange_like")) return "fast_filling";
-      if (lower.includes("grey_like")) return "housefull_or_unavailable";
-
-      return "unknown";
-    }
-
-    const nodes = Array.from(document.querySelectorAll("a, button, div, span"));
-    const result: Array<{ id: string; status: StatusKind; rawColor: string }> = [];
-    const usedIndexes = new Set<number>();
-
-    for (const item of expected) {
-      const movie = clean(item.movie).toLowerCase();
-      const row = clean(item.row).toLowerCase();
-      const time = clean(item.time);
-      const screenText = clean(item.screenText).toLowerCase();
-
-      const candidates = nodes
-        .map((node, index) => ({ node, index }))
-        .filter(({ node }) => {
-        const text = clean(
-          (node as HTMLElement).innerText || node.textContent || ""
-        );
-        return text === time || text.includes(` ${time} `) || text.includes(time);
-      });
-
-      let bestMatch:
-        | { element: Element; score: number; index: number }
-        | null = null;
-
-      for (const candidate of candidates) {
-        const element = candidate.node;
-        const nearby = clean(
-          [
-            (element as HTMLElement).innerText,
-            (element.parentElement as HTMLElement | null)?.innerText,
-            (element.parentElement?.parentElement as HTMLElement | null)
-              ?.innerText,
-            (element.parentElement?.parentElement?.parentElement as
-              | HTMLElement
-              | null)?.innerText
-          ].join(" ")
-        ).toLowerCase();
-
-        let score = 0;
-
-        if (movie && nearby.includes(movie)) score += 4;
-        if (row && nearby.includes(row)) score += 3;
-        if (nearby.includes(time.toLowerCase())) score += 2;
-        if (screenText && nearby.includes(screenText)) score += 5;
-        if (screenText && !nearby.includes(screenText)) score -= 2;
-        if (usedIndexes.has(candidate.index)) score -= 4;
-
-        if (!bestMatch || score > bestMatch.score) {
-          bestMatch = { element, score, index: candidate.index };
-        }
-      }
-
-      if (!bestMatch) {
-        continue;
-      }
-
-      usedIndexes.add(bestMatch.index);
-
-      const style = window.getComputedStyle(bestMatch.element as Element);
-      const rawColor = clean(
-        [
-          `color=${style.color}`,
-          `background=${style.backgroundColor}`,
-          `border=${style.borderColor}`,
-          `bucket=${colorBucket(style.color)}`,
-          `bucket=${colorBucket(style.backgroundColor)}`,
-          `bucket=${colorBucket(style.borderColor)}`
-        ].join("; ")
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || "1") > 0
       );
-
-      result.push({
-        id: item.id,
-        status: classifyStatus(rawColor),
-        rawColor
-      });
     }
 
-    const unique = new Map<string, { id: string; status: StatusKind; rawColor: string }>();
-
-    for (const item of result) {
-      if (!unique.has(item.id)) {
-        unique.set(item.id, item);
-      }
+    function isTimeOnlyText(text: string) {
+      return /^(0?[1-9]|1[0-2]):[0-5][0-9]\s*(AM|PM)$/i.test(
+        normalizeText(text)
+      );
     }
 
-    return Array.from(unique.values());
-  }, items);
+    function parseRgbNumbers(value: string) {
+      const match = String(value || "").match(/rgba?\(([^)]+)\)/i);
+      if (!match) return null;
 
-  const byId = new Map(statuses.map((item) => [item.id, item]));
+      const parts = match[1]
+        .split(",")
+        .map((x) => Number(String(x).trim()))
+        .filter((x) => Number.isFinite(x));
 
-  return items.map((item) => {
-    const domStatus = byId.get(item.id);
+      if (parts.length < 3) return null;
 
-    if (!domStatus) {
       return {
-        ...item,
-        label: compactShowtime(item)
+        r: parts[0],
+        g: parts[1],
+        b: parts[2],
+        a: parts.length >= 4 ? parts[3] : 1
       };
     }
 
-    return {
-      ...item,
-      status: domStatus.status,
-      rawColor: domStatus.rawColor,
-      label: compactShowtime(item)
-    };
+    function classifyRgbColor(value: string) {
+      const rgb = parseRgbNumbers(value);
+      if (!rgb) return "unknown";
+
+      const { r, g, b, a } = rgb;
+      if (a === 0) return "transparent";
+
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const spread = max - min;
+
+      if (g >= 110 && g > r + 25 && g > b + 25) return "green_like";
+      if (r >= 150 && r > g + 35 && r > b + 35) return "red_like";
+      if (r >= 180 && g >= 80 && g <= 190 && b <= 100) return "orange_like";
+      if (r >= 170 && g >= 145 && b <= 110) return "yellow_like";
+
+      if (spread <= 20 && max <= 180) return "grey_like";
+
+      return "non_grey";
+    }
+
+    function getExactChipColor(el: Element) {
+      const style = window.getComputedStyle(el);
+
+      const color = style.color;
+      const borderTop = style.borderTopColor;
+      const borderRight = style.borderRightColor;
+      const borderBottom = style.borderBottomColor;
+      const borderLeft = style.borderLeftColor;
+      const background = style.backgroundColor;
+
+      const colorBucket = classifyRgbColor(color);
+
+      let finalBucket = colorBucket;
+
+      if (finalBucket === "transparent" || finalBucket === "unknown") {
+        const borderBuckets = [
+          classifyRgbColor(borderTop),
+          classifyRgbColor(borderRight),
+          classifyRgbColor(borderBottom),
+          classifyRgbColor(borderLeft)
+        ].filter((x) => x !== "transparent" && x !== "unknown");
+
+        finalBucket = borderBuckets[0] || "unknown";
+      }
+
+      return {
+        colorBucket: finalBucket,
+        rawColor: `chip.color=${color}; chip.background=${background}; chip.borderTop=${borderTop}; chip.borderRight=${borderRight}; chip.borderBottom=${borderBottom}; chip.borderLeft=${borderLeft}`
+      };
+    }
+
+    function extractDomTimeChips() {
+      const all = Array.from(document.querySelectorAll("a,button,span,div"));
+      const chips: Array<{
+        time: string;
+        colorBucket: string;
+        rawColor: string;
+        top: number;
+        left: number;
+        width: number;
+        height: number;
+      }> = [];
+
+      for (const el of all) {
+        const text = normalizeText(el.textContent || "");
+
+        if (!isTimeOnlyText(text)) continue;
+        if (!isVisibleElement(el)) continue;
+
+        const rect = el.getBoundingClientRect();
+
+        if (rect.width > 220 || rect.height > 90) continue;
+
+        const colorInfo = getExactChipColor(el);
+
+        chips.push({
+          time: text.toUpperCase(),
+          colorBucket: colorInfo.colorBucket,
+          rawColor: colorInfo.rawColor,
+          top: Math.round(rect.top),
+          left: Math.round(rect.left),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        });
+      }
+
+      chips.sort((a, b) => {
+        if (a.top !== b.top) return a.top - b.top;
+        return a.left - b.left;
+      });
+
+      return chips;
+    }
+
+    return extractDomTimeChips();
   });
+
+  function statusFromColorBucket(bucket: string): StatusKind {
+    const value = String(bucket || "").toLowerCase();
+
+    if (value === "grey_like") return "housefull_or_unavailable";
+    if (value === "green_like") return "available";
+    if (["yellow_like", "orange_like", "red_like"].includes(value)) {
+      return "fast_filling";
+    }
+
+    return "unknown";
+  }
+
+  const chipsByTime = new Map<string, typeof domChips>();
+
+  for (const chip of domChips) {
+    const key = String(chip.time || "").toUpperCase();
+    if (!chipsByTime.has(key)) chipsByTime.set(key, []);
+    chipsByTime.get(key)!.push(chip);
+  }
+
+  const useCountByTime = new Map<string, number>();
+  const mergedById = new Map<string, ShowtimeSnapshot>();
+  const sortedItems = [...items].sort(
+    (a, b) => Number(a.originalPageIndex || 0) - Number(b.originalPageIndex || 0)
+  );
+
+  for (const item of sortedItems) {
+    const key = String(item.time || "").toUpperCase();
+    const used = useCountByTime.get(key) || 0;
+    const chip = (chipsByTime.get(key) || [])[used];
+
+    useCountByTime.set(key, used + 1);
+
+    const colorBucket = chip?.colorBucket || "unknown";
+    const rawColor = chip?.rawColor || "chip_not_found";
+
+    mergedById.set(item.id, {
+      ...item,
+      colorBucket,
+      rawColor,
+      status: statusFromColorBucket(colorBucket),
+      label: compactShowtime(item)
+    });
+  }
+
+  const mergedItems = items.map((item) => {
+    return (
+      mergedById.get(item.id) || {
+        ...item,
+        colorBucket: "unknown",
+        rawColor: "chip_not_found",
+        status: "unknown",
+        label: compactShowtime(item)
+      }
+    );
+  });
+
+  console.log(
+    "Extracted show colors:",
+    mergedItems.map((x) => ({
+      label: x.label,
+      colorBucket: x.colorBucket,
+      rawColor: x.rawColor
+    }))
+  );
+
+  return mergedItems;
 }
 
 function decide(
   previousSnapshot: SnapshotState | null,
   currentSnapshot: SnapshotState
 ): Decision {
-  if (
-    !previousSnapshot ||
-    previousSnapshot.monitorSchemaVersion !== CONFIG.monitorSchemaVersion
-  ) {
+  if (!previousSnapshot || !hasMatchingSchemaVersion(previousSnapshot, currentSnapshot)) {
     return {
       shouldSendTelegram: false,
       reason: !previousSnapshot
@@ -723,46 +809,27 @@ function decide(
     };
   }
 
-  const previousById = new Map(
-    previousSnapshot.items.map((item) => [item.id, item] as const)
-  );
-  const currentById = new Map(
-    currentSnapshot.items.map((item) => [item.id, item] as const)
-  );
+  const compared = compareSnapshots(previousSnapshot, currentSnapshot);
+  const { added, removed, statusChanged, colorChanged } = compared;
 
-  const added = currentSnapshot.items.filter((item) => !previousById.has(item.id));
-  const removed = previousSnapshot.items.filter((item) => !currentById.has(item.id));
-  const statusChanged: StatusChange[] = [];
-
-  for (const item of currentSnapshot.items) {
-    const previousItem = previousById.get(item.id);
-
-    if (!previousItem || previousItem.status === item.status) {
-      continue;
-    }
-
-    statusChanged.push({
-      before: previousItem,
-      after: item
-    });
-  }
-
-  if (!added.length && !removed.length && !statusChanged.length) {
+  if (!added.length && !removed.length && !statusChanged.length && !colorChanged.length) {
     return {
       shouldSendTelegram: false,
-      reason: "No timing or status changes.",
+      reason: "No timing, status, or color changes.",
       added,
       removed,
-      statusChanged
+      statusChanged,
+      colorChanged
     };
   }
 
   return {
     shouldSendTelegram: true,
-    reason: "Added, removed, or status changes detected.",
+    reason: "Added, removed, status, or color changes detected.",
     added,
     removed,
-    statusChanged
+    statusChanged,
+    colorChanged
   };
 }
 
@@ -777,16 +844,16 @@ function buildTelegramMessage(currentSnapshot: SnapshotState, decision: Decision
 
   if (decision.added?.length) {
     lines.push("Added:");
-    for (const item of decision.added.slice(0, 20)) {
-      lines.push(`+ ${compactShowtime(item)} (${item.status})`);
+    for (const item of collapseDuplicateChanges(decision.added).slice(0, 20)) {
+      lines.push(`+ ${formatDuplicateChangeLine(item)} (${item.status})`);
     }
     lines.push("");
   }
 
   if (decision.removed?.length) {
     lines.push("Removed:");
-    for (const item of decision.removed.slice(0, 20)) {
-      lines.push(`- ${compactShowtime(item)}`);
+    for (const item of collapseDuplicateChanges(decision.removed).slice(0, 20)) {
+      lines.push(`- ${formatDuplicateChangeLine(item)}`);
     }
     lines.push("");
   }
@@ -794,41 +861,471 @@ function buildTelegramMessage(currentSnapshot: SnapshotState, decision: Decision
   if (decision.statusChanged?.length) {
     lines.push("Status changed:");
     for (const item of decision.statusChanged.slice(0, 20)) {
-      lines.push(`* ${compactShowtime(item.after)}`);
-      lines.push(`  ${item.before.status} -> ${item.after.status}`);
+      lines.push(`* ${compactShowtime(item.current)}`);
+      lines.push(`  ${item.oldStatus} -> ${item.newStatus}`);
     }
     lines.push("");
+  }
+
+  if (decision.colorChanged?.length) {
+    lines.push("");
+    lines.push("Color changed:");
+    for (const item of decision.colorChanged) {
+      lines.push(`* ${compactShowtime(item.current)}`);
+      lines.push(`  ${item.oldColorBucket} → ${item.newColorBucket}`);
+    }
   }
 
   lines.push(currentSnapshot.targetUrl);
   return lines.join("\n");
 }
 
-function buildShowtimeId(
-  movie: string,
-  row: string,
-  time: string,
-  screenText: string,
-  duplicateSlot = 0
-) {
-  const movieKey = normalizeKeyPart(movie);
-  const rowKey = normalizeKeyPart(row);
-  const timeKey = normalizeKeyPart(time);
-  const screenKey = normalizeScreenKey(screenText);
+function compactShowtime(item: any) {
+  const movie = item.movie || "Unknown movie";
+  const row = item.row || "Unknown format";
+  const time = item.time || "Unknown time";
+  const screenText = cleanScreenText(item.screenText);
 
-  const finalScreenKey = screenKey || `unknown-screen-${duplicateSlot || 1}`;
-
-  return `${movieKey} | ${rowKey} | ${timeKey} | ${finalScreenKey}`;
+  return `${movie} \u2014 ${row} | ${time}${
+    screenText ? ` | ${screenText}` : " | no screen label"
+  }`;
 }
 
-function compactShowtime(item: any) {
-  const row = String(item.row || "").replace(/\s+/g, " ").trim();
-  const time = String(item.time || "").replace(/\s+/g, " ").trim();
-  const screenText = String(item.screenText || "").replace(/\s+/g, " ").trim();
+function buildShowBaseKey(item: any) {
+  return [
+    normalizeKeyPart(item.movie),
+    normalizeKeyPart(item.row),
+    normalizeKeyPart(item.time),
+    normalizeScreenKey(item.screenText) || "no-screen"
+  ].join(" | ");
+}
 
-  return `${item.movie || "Unknown movie"} \u2014 ${row} | ${time}${
-    screenText ? ` | ${screenText}` : ""
-  }`;
+function assignOccurrenceIds(items: any[]) {
+  const counters = new Map<string, number>();
+
+  return items.map((item) => {
+    const baseKey = buildShowBaseKey(item);
+    const occurrence = (counters.get(baseKey) || 0) + 1;
+    counters.set(baseKey, occurrence);
+
+    return {
+      ...item,
+      baseKey,
+      occurrence,
+      id: `${baseKey} | occurrence-${occurrence}`
+    };
+  });
+}
+
+function compareShowItems(left: any, right: any) {
+  const partsLeft = [
+    normalizeKeyPart(left.movie),
+    normalizeKeyPart(left.row),
+    normalizeKeyPart(left.time),
+    normalizeScreenKey(left.screenText),
+    Number(left.originalPageIndex || 0).toString().padStart(6, "0")
+  ];
+  const partsRight = [
+    normalizeKeyPart(right.movie),
+    normalizeKeyPart(right.row),
+    normalizeKeyPart(right.time),
+    normalizeScreenKey(right.screenText),
+    Number(right.originalPageIndex || 0).toString().padStart(6, "0")
+  ];
+
+  return partsLeft.join(" | ").localeCompare(partsRight.join(" | "));
+}
+
+function countByBaseKey(items: any[]) {
+  const map = new Map<string, { count: number; sample: any }>();
+
+  for (const item of items || []) {
+    const baseKey = item.baseKey || buildShowBaseKey(item);
+    const existing = map.get(baseKey);
+
+    if (existing) {
+      existing.count += 1;
+    } else {
+      map.set(baseKey, { count: 1, sample: item });
+    }
+  }
+
+  return map;
+}
+
+function compareSnapshots(previous: any, current: any) {
+  const oldCounts = countByBaseKey(previous.items || []);
+  const newCounts = countByBaseKey(current.items || []);
+
+  const added: any[] = [];
+  const removed: any[] = [];
+
+  const allKeys = new Set([...oldCounts.keys(), ...newCounts.keys()]);
+
+  for (const key of allKeys) {
+    const oldEntry = oldCounts.get(key);
+    const newEntry = newCounts.get(key);
+
+    const oldCount = oldEntry?.count || 0;
+    const newCount = newEntry?.count || 0;
+
+    if (newCount > oldCount && newEntry) {
+      const diff = newCount - oldCount;
+      for (let i = 0; i < diff; i++) {
+        added.push({
+          ...newEntry.sample,
+          duplicateChangeCount: diff
+        });
+      }
+    }
+
+    if (oldCount > newCount && oldEntry) {
+      const diff = oldCount - newCount;
+      for (let i = 0; i < diff; i++) {
+        removed.push({
+          ...oldEntry.sample,
+          duplicateChangeCount: diff
+        });
+      }
+    }
+  }
+
+  const statusChanged = compareStatusChanges(previous.items || [], current.items || []);
+  const colorChanged = compareColorChanges(previous.items || [], current.items || []);
+
+  return {
+    added,
+    removed,
+    statusChanged,
+    colorChanged,
+    addedCount: added.length,
+    removedCount: removed.length,
+    statusChangedCount: statusChanged.length,
+    colorChangedCount: colorChanged.length,
+    changed:
+      added.length > 0 ||
+      removed.length > 0 ||
+      statusChanged.length > 0 ||
+      colorChanged.length > 0
+  };
+}
+
+function parseRgbNumbers(value: string) {
+  const match = String(value || "").match(/rgba?\(([^)]+)\)/i);
+  if (!match) return null;
+
+  const parts = match[1]
+    .split(",")
+    .map((x) => Number(String(x).trim()))
+    .filter((x) => Number.isFinite(x));
+
+  if (parts.length < 3) return null;
+
+  return {
+    r: parts[0],
+    g: parts[1],
+    b: parts[2],
+    a: parts.length >= 4 ? parts[3] : 1
+  };
+}
+
+function classifyRgbColor(value: string) {
+  const rgb = parseRgbNumbers(value);
+  if (!rgb) return "unknown";
+
+  const { r, g, b, a } = rgb;
+
+  if (a === 0) return "transparent";
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const spread = max - min;
+
+  if (spread <= 18 && max <= 170) return "grey_like";
+  if (spread <= 18 && max >= 171) return "grey_like";
+  if (g >= 110 && g > r + 25 && g > b + 25) return "green_like";
+  if (r >= 150 && r > g + 35 && r > b + 35) return "red_like";
+  if (r >= 180 && g >= 80 && g <= 190 && b <= 90) return "orange_like";
+  if (r >= 170 && g >= 150 && b <= 100) return "yellow_like";
+
+  return "non_grey";
+}
+
+function scoreColorCandidate(candidate: string, bucket: string) {
+  const lower = String(candidate || "").toLowerCase();
+  let score = 0;
+
+  if (lower.startsWith("self.")) score += 12;
+  else if (lower.startsWith("child.")) score += 9;
+  else if (lower.startsWith("parent1.")) score += 7;
+  else if (lower.startsWith("parent2.")) score += 5;
+  else if (lower.startsWith("parent3.")) score += 3;
+  else if (lower.startsWith("parent4.")) score += 2;
+
+  if (
+    lower.includes(".background=") ||
+    lower.includes(".border") ||
+    lower.includes(".fill=") ||
+    lower.includes(".stroke=") ||
+    lower.includes(".svg")
+  ) {
+    score += 6;
+  } else if (lower.includes(".color=")) {
+    score += 2;
+  }
+
+  if (lower.includes(".before.") || lower.includes(".after.")) {
+    score += 4;
+  }
+
+  if (bucket === "grey_like") score += 1;
+  if (bucket === "green_like") score += 5;
+  if (bucket === "yellow_like") score += 4;
+  if (bucket === "orange_like") score += 4;
+  if (bucket === "red_like") score += 4;
+  if (bucket === "non_grey") score += 1;
+
+  return score;
+}
+
+function bestBucketFromCandidates(candidates: string[]) {
+  const scoreByBucket = new Map<string, number>();
+
+  for (const candidate of candidates) {
+    const bucket = classifyRgbColor(candidate);
+    if (!bucket || bucket === "transparent" || bucket === "unknown") {
+      continue;
+    }
+
+    const score = scoreColorCandidate(candidate, bucket);
+    scoreByBucket.set(bucket, (scoreByBucket.get(bucket) || 0) + score);
+  }
+
+  const priority = [
+    "green_like",
+    "yellow_like",
+    "orange_like",
+    "red_like",
+    "grey_like",
+    "non_grey"
+  ];
+
+  let bestBucket = "unknown";
+  let bestScore = -1;
+
+  for (const bucket of priority) {
+    const score = scoreByBucket.get(bucket) || 0;
+    if (score > bestScore) {
+      bestBucket = bucket;
+      bestScore = score;
+    }
+  }
+
+  return bestScore > 0 ? bestBucket : "unknown";
+}
+
+function getColorBucket(item: any) {
+  const explicit = String(item?.colorBucket || item?.availabilityColorBucket || "")
+    .toLowerCase()
+    .trim();
+  const raw = String(item?.rawColor || "");
+
+  if (explicit === "yellow_or_orange_like") return "orange_like";
+  if (
+    [
+      "grey_like",
+      "green_like",
+      "yellow_like",
+      "orange_like",
+      "red_like",
+      "non_grey",
+      "unknown"
+    ].includes(explicit)
+  ) {
+    return explicit;
+  }
+
+  const rawLower = raw.toLowerCase();
+
+  if (rawLower.includes("bucket=grey_like") || rawLower.includes("grey_like")) {
+    return "grey_like";
+  }
+  if (rawLower.includes("bucket=green_like") || rawLower.includes("green_like")) {
+    return "green_like";
+  }
+  if (rawLower.includes("bucket=yellow_like") || rawLower.includes("yellow_like")) {
+    return "yellow_like";
+  }
+  if (rawLower.includes("bucket=orange_like") || rawLower.includes("orange_like")) {
+    return "orange_like";
+  }
+  if (rawLower.includes("bucket=red_like") || rawLower.includes("red_like")) {
+    return "red_like";
+  }
+
+  const candidates = raw
+    .split(";")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const derived = bestBucketFromCandidates(candidates);
+
+  return derived;
+}
+
+function isGreyBucket(bucket: string) {
+  return String(bucket || "").toLowerCase() === "grey_like";
+}
+
+function isUsefulNonGreyBucket(bucket: string) {
+  return ["green_like", "yellow_like", "orange_like", "red_like", "non_grey"].includes(
+    String(bucket || "").toLowerCase()
+  );
+}
+
+function findPreviousComparableItem(oldItems: any[], current: any) {
+  const items = oldItems || [];
+
+  const byId = items.find((x) => x.id === current.id);
+  if (byId) return byId;
+
+  const currentBaseKey = String(current.baseKey || buildShowBaseKey(current));
+  const currentOccurrence = Number(current.occurrence || 0);
+  const sameBaseKey = items.filter(
+    (x) => String(x.baseKey || buildShowBaseKey(x)) === currentBaseKey
+  );
+
+  if (sameBaseKey.length === 1) {
+    return sameBaseKey[0];
+  }
+
+  if (sameBaseKey.length > 1 && currentOccurrence > 0) {
+    const sameOccurrence = sameBaseKey.find(
+      (x) => Number(x.occurrence || 0) === currentOccurrence
+    );
+    if (sameOccurrence) return sameOccurrence;
+  }
+
+  const screenKey = normalizeScreenKey(current.screenText);
+  const fallbackCandidates = items.filter((x) => {
+    return (
+      normalizeKeyPart(x.movie) === normalizeKeyPart(current.movie) &&
+      normalizeKeyPart(x.row) === normalizeKeyPart(current.row) &&
+      normalizeKeyPart(x.time) === normalizeKeyPart(current.time) &&
+      normalizeScreenKey(x.screenText) === screenKey
+    );
+  });
+
+  if (fallbackCandidates.length === 1) {
+    return fallbackCandidates[0];
+  }
+
+  if (fallbackCandidates.length > 1 && currentOccurrence > 0) {
+    const sameOccurrence = fallbackCandidates.find(
+      (x) => Number(x.occurrence || 0) === currentOccurrence
+    );
+    if (sameOccurrence) return sameOccurrence;
+  }
+
+  if (fallbackCandidates.length > 1) {
+    const currentIndex = Number(current.originalPageIndex || 0);
+    return [...fallbackCandidates].sort((left, right) => {
+      return (
+        Math.abs(Number(left.originalPageIndex || 0) - currentIndex) -
+        Math.abs(Number(right.originalPageIndex || 0) - currentIndex)
+      );
+    })[0];
+  }
+
+  return null;
+}
+
+function compareColorChanges(oldItems: any[], newItems: any[]) {
+  const changed: Array<{
+    previous: ShowtimeSnapshot;
+    current: ShowtimeSnapshot;
+    oldColorBucket: string;
+    newColorBucket: string;
+  }> = [];
+
+  for (const current of newItems || []) {
+    const previous = findPreviousComparableItem(oldItems || [], current);
+    if (!previous) continue;
+
+    const oldColorBucket = String(
+      previous.colorBucket || getColorBucket(previous) || "unknown"
+    ).toLowerCase();
+    const newColorBucket = String(
+      current.colorBucket || getColorBucket(current) || "unknown"
+    ).toLowerCase();
+
+    if (!(isGreyBucket(oldColorBucket) && isUsefulNonGreyBucket(newColorBucket))) {
+      continue;
+    }
+
+    changed.push({
+      previous,
+      current,
+      oldColorBucket,
+      newColorBucket
+    });
+  }
+
+  return changed;
+}
+
+function compareStatusChanges(oldItems: any[], newItems: any[]) {
+  const changed: StatusChange[] = [];
+
+  for (const current of newItems) {
+    const previous = findPreviousComparableItem(oldItems || [], current);
+    if (!previous) continue;
+
+    const isAmbiguousDuplicate =
+      String(current.baseKey || "").includes("| no-screen") &&
+      Number(current.occurrence || 0) > 1;
+
+    if (isAmbiguousDuplicate) continue;
+
+    if (
+      previous.status &&
+      current.status &&
+      previous.status !== current.status
+    ) {
+      changed.push({
+        previous,
+        current,
+        oldStatus: previous.status,
+        newStatus: current.status
+      });
+    }
+  }
+
+  return changed;
+}
+
+function collapseDuplicateChanges(items: any[]) {
+  const grouped = new Map<string, any>();
+
+  for (const item of items || []) {
+    const key = item.baseKey || buildShowBaseKey(item);
+    const existing = grouped.get(key);
+
+    if (existing) {
+      existing.duplicateChangeCount += 1;
+    } else {
+      grouped.set(key, {
+        ...item,
+        duplicateChangeCount: 1
+      });
+    }
+  }
+
+  return [...grouped.values()];
+}
+
+function formatDuplicateChangeLine(item: any) {
+  const count = Number(item.duplicateChangeCount || 1);
+  return `${compactShowtime(item)}${count > 1 ? ` x${count}` : ""}`;
 }
 
 function normalizeKeyPart(value: string) {
