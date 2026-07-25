@@ -6,7 +6,7 @@ const CONFIG = {
   snapshotKeyPrefix: "bms:snapshot:",
   historyKeyPrefix: "bms:history:",
   notifyChatsKey: "bms:notify-chats",
-  monitorSchemaVersion: 6,
+  monitorSchemaVersion: 7,
   pageSettleMs: 12000
 };
 
@@ -323,7 +323,15 @@ function extractAllShowtimesFromText(bodyText: string) {
     });
   }
 
-  const results: ShowtimeSnapshot[] = [];
+  const rawResults: Array<
+    Omit<ShowtimeSnapshot, "id"> & {
+      movie: string;
+      rating: string;
+      row: string;
+      time: string;
+      screenText: string;
+    }
+  > = [];
 
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
@@ -369,29 +377,11 @@ function extractAllShowtimesFromText(bodyText: string) {
           ? matches[j + 1].index
           : blockBody.length;
 
-      let screenText = blockBody
-        .slice(currentEnd, nextTimeStart)
-        .replace(/\bAVAILABLE\b/gi, "")
-        .replace(/\bFAST FILLING\b/gi, "")
-        .replace(/\bLANG SUBTITLES\b/gi, "")
-        .replace(/\bSUBTITLES\b/gi, "")
-        .replace(/\s+/g, " ")
-        .trim();
+      const screenText = cleanScreenText(
+        blockBody.slice(currentEnd, nextTimeStart)
+      );
 
-      screenText = stopFooterNoise(screenText).slice(0, 80).trim();
-
-      if (
-        /HomeCinemas|List your Show|Got a show|CUSTOMER CARE|MOVIES NOW SHOWING/i.test(
-          screenText
-        )
-      ) {
-        screenText = "";
-      }
-
-      const id = buildShowtimeId(marker.movie, row, time);
-
-      results.push({
-        id,
+      rawResults.push({
         movie: marker.movie,
         rating: marker.rating,
         row,
@@ -409,9 +399,48 @@ function extractAllShowtimesFromText(bodyText: string) {
     }
   }
 
+  const duplicateCounters = new Map<string, number>();
+  const finalResults: ShowtimeSnapshot[] = [];
+
+  for (const item of rawResults) {
+    const cleanScreen = cleanScreenText(item.screenText);
+    const duplicateBase = `${normalizeKeyPart(item.movie)} | ${normalizeKeyPart(
+      item.row
+    )} | ${normalizeKeyPart(item.time)}`;
+
+    const needsDuplicateSlot = !normalizeScreenKey(cleanScreen);
+    let duplicateSlot = 0;
+
+    if (needsDuplicateSlot) {
+      const nextCount = (duplicateCounters.get(duplicateBase) || 0) + 1;
+      duplicateCounters.set(duplicateBase, nextCount);
+      duplicateSlot = nextCount;
+    }
+
+    const id = buildShowtimeId(
+      item.movie,
+      item.row,
+      item.time,
+      cleanScreen,
+      duplicateSlot
+    );
+
+    finalResults.push({
+      ...item,
+      id,
+      screenText: cleanScreen,
+      label: compactShowtime({
+        movie: item.movie,
+        row: item.row,
+        time: item.time,
+        screenText: cleanScreen
+      })
+    });
+  }
+
   const unique = new Map<string, ShowtimeSnapshot>();
 
-  for (const item of results) {
+  for (const item of finalResults) {
     if (!unique.has(item.id)) {
       unique.set(item.id, item);
     }
@@ -472,13 +501,17 @@ async function extractShowtimeStatusesFromDom(
 
     const nodes = Array.from(document.querySelectorAll("a, button, div, span"));
     const result: Array<{ id: string; status: StatusKind; rawColor: string }> = [];
+    const usedIndexes = new Set<number>();
 
     for (const item of expected) {
       const movie = clean(item.movie).toLowerCase();
       const row = clean(item.row).toLowerCase();
       const time = clean(item.time);
+      const screenText = clean(item.screenText).toLowerCase();
 
-      const candidates = nodes.filter((node) => {
+      const candidates = nodes
+        .map((node, index) => ({ node, index }))
+        .filter(({ node }) => {
         const text = clean(
           (node as HTMLElement).innerText || node.textContent || ""
         );
@@ -486,10 +519,11 @@ async function extractShowtimeStatusesFromDom(
       });
 
       let bestMatch:
-        | { element: Element; score: number }
+        | { element: Element; score: number; index: number }
         | null = null;
 
-      for (const element of candidates) {
+      for (const candidate of candidates) {
+        const element = candidate.node;
         const nearby = clean(
           [
             (element as HTMLElement).innerText,
@@ -507,15 +541,20 @@ async function extractShowtimeStatusesFromDom(
         if (movie && nearby.includes(movie)) score += 4;
         if (row && nearby.includes(row)) score += 3;
         if (nearby.includes(time.toLowerCase())) score += 2;
+        if (screenText && nearby.includes(screenText)) score += 5;
+        if (screenText && !nearby.includes(screenText)) score -= 2;
+        if (usedIndexes.has(candidate.index)) score -= 4;
 
         if (!bestMatch || score > bestMatch.score) {
-          bestMatch = { element, score };
+          bestMatch = { element, score, index: candidate.index };
         }
       }
 
       if (!bestMatch) {
         continue;
       }
+
+      usedIndexes.add(bestMatch.index);
 
       const style = window.getComputedStyle(bestMatch.element as Element);
       const rawColor = clean(
@@ -659,11 +698,21 @@ function buildTelegramMessage(currentSnapshot: SnapshotState, decision: Decision
   return lines.join("\n");
 }
 
-function buildShowtimeId(movie: string, row: string, time: string) {
-  return `${movie} | ${row} | ${time}`
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+function buildShowtimeId(
+  movie: string,
+  row: string,
+  time: string,
+  screenText: string,
+  duplicateSlot = 0
+) {
+  const movieKey = normalizeKeyPart(movie);
+  const rowKey = normalizeKeyPart(row);
+  const timeKey = normalizeKeyPart(time);
+  const screenKey = normalizeScreenKey(screenText);
+
+  const finalScreenKey = screenKey || `unknown-screen-${duplicateSlot || 1}`;
+
+  return `${movieKey} | ${rowKey} | ${timeKey} | ${finalScreenKey}`;
 }
 
 function compactShowtime(item: any) {
@@ -671,9 +720,57 @@ function compactShowtime(item: any) {
   const time = String(item.time || "").replace(/\s+/g, " ").trim();
   const screenText = String(item.screenText || "").replace(/\s+/g, " ").trim();
 
-  return `${item.movie || "Unknown movie"} - ${row} | ${time}${
+  return `${item.movie || "Unknown movie"} \u2014 ${row} | ${time}${
     screenText ? ` | ${screenText}` : ""
   }`;
+}
+
+function normalizeKeyPart(value: string) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeScreenKey(value: string) {
+  const cleaned = cleanScreenText(value);
+
+  if (!cleaned) return "";
+
+  return cleaned
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function cleanScreenText(value: string) {
+  let text = String(value || "")
+    .replace(/\bAVAILABLE\b/gi, "")
+    .replace(/\bFAST FILLING\b/gi, "")
+    .replace(/\bLANG SUBTITLES\b/gi, "")
+    .replace(/\bSUBTITLES\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  text = stopFooterNoise(text);
+
+  if (
+    /HomeCinemas|List your Show|Got a show|CUSTOMER CARE|MOVIES NOW SHOWING/i.test(
+      text
+    )
+  ) {
+    return "";
+  }
+
+  if (/\b(?:0?[1-9]|1[0-2]):[0-5][0-9]\s*(?:AM|PM)\b/i.test(text)) {
+    return "";
+  }
+
+  if (/\((U|A|UA|UA\d+\+?|U\/A|U\/A\s*\d+\+?)\)/i.test(text)) {
+    return "";
+  }
+
+  return text.slice(0, 80).trim();
 }
 
 function isBlockedPage(input: {
